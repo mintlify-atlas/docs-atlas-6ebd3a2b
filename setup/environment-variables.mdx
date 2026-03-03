@@ -48,6 +48,10 @@ These variables must be set for PyWorker to function correctly.
 <ParamField path="PYWORKER_MANIFEST_SECRET" type="string" required>
   Shared HMAC secret for signing and verifying LoRA manifests. Must match the secret used by your Trigger service.
   
+  <Note>
+    While this variable is listed as required in the fork's README, it can be omitted if you don't need signed manifest verification. When set, manifests are automatically required unless `PYWORKER_REQUIRE_MANIFEST=false`.
+  </Note>
+  
   ```bash
   PYWORKER_MANIFEST_SECRET=your-secret-key-here
   ```
