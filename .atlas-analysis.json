@@ -1,0 +1,91 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "PyWorker",
+  "projectDescription": "Serverless Python worker agent for running ComfyUI on Vast.ai infrastructure",
+  "theme": "aspen",
+  "primaryColor": "#8B5CF6",
+  "lightColor": "#A78BFA",
+  "darkColor": "#7C3AED",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Setup & Deployment",
+            "pages": [
+              "setup/environment-variables",
+              "setup/provisioning",
+              "setup/worker-configuration"
+            ]
+          },
+          {
+            "group": "Usage",
+            "pages": [
+              "usage/client-sdk",
+              "usage/request-format",
+              "usage/workflow-modes",
+              "usage/lora-management"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/architecture",
+              "operations/monitoring",
+              "operations/troubleshooting"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "security/manifest-signing",
+              "security/environment-secrets"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/generate-sync",
+              "api/readyz"
+            ]
+          },
+          {
+            "group": "Worker",
+            "pages": [
+              "api/worker-config",
+              "api/handler-config"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Serverless ComfyUI worker deployment on Vast.ai",
+    "Custom workflow JSON support",
+    "Dynamic LoRA downloading with HMAC signing",
+    "Parallel model provisioning with aria2c",
+    "Bootstrap benchmark for worker initialization",
+    "S3-compatible storage integration"
+  ],
+  "publicApiSurface": [
+    "/generate/sync - Generate images using modifiers or custom workflows",
+    "/readyz - Health check endpoint for provisioning status",
+    "ensure_required_loras() - Validates and downloads LoRA models",
+    "workload_calculator() - Estimates generation workload",
+    "parse_and_verify_manifest() - Verifies signed LoRA manifests"
+  ]
+}
