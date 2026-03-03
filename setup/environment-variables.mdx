@@ -1,0 +1,333 @@
+---
+title: Environment Variables
+description: Complete reference of all environment variables used in PyWorker
+---
+
+## Overview
+
+PyWorker uses environment variables for configuration across provisioning, worker runtime, and model server integration. Variables can be set in your Vast.ai template or at runtime.
+
+## Required Variables
+
+These variables must be set for PyWorker to function correctly.
+
+<ParamField path="BACKEND" type="string" required>
+  Backend worker type. Must be set to `comfyui-json` for this fork.
+  
+  ```bash
+  BACKEND=comfyui-json
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_REPO" type="string" required>
+  Git repository URL for the PyWorker codebase.
+  
+  ```bash
+  PYWORKER_REPO=https://github.com/ByQwank/pyworker
+  ```
+</ParamField>
+
+<ParamField path="PROVISIONING_SCRIPT" type="string" required>
+  Raw URL to the provisioning script (typically `default.sh`).
+  
+  ```bash
+  PROVISIONING_SCRIPT=https://raw.githubusercontent.com/ByQwank/pyworker/main/default.sh
+  ```
+  
+  To pin to a specific commit, replace `main` with the commit SHA.
+</ParamField>
+
+<ParamField path="HF_TOKEN" type="string" required>
+  HuggingFace authentication token for downloading models and LoRAs.
+  
+  ```bash
+  HF_TOKEN=hf_xxxxxxxxxxxxx
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_MANIFEST_SECRET" type="string" required>
+  Shared HMAC secret for signing and verifying LoRA manifests. Must match the secret used by your Trigger service.
+  
+  ```bash
+  PYWORKER_MANIFEST_SECRET=your-secret-key-here
+  ```
+</ParamField>
+
+<ParamField path="CONTAINER_ID" type="string" required>
+  Vast.ai container ID. Automatically set by Vast.ai infrastructure.
+  
+  ```bash
+  CONTAINER_ID=12345
+  ```
+</ParamField>
+
+## Optional Variables
+
+### PyWorker Configuration
+
+<ParamField path="PYWORKER_REF" type="string" default="main">
+  Git branch, tag, or commit to checkout from `PYWORKER_REPO`.
+  
+  ```bash
+  PYWORKER_REF=v1.2.3
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_VERSION" type="string" default="0">
+  Version identifier for error reporting.
+  
+  ```bash
+  PYWORKER_VERSION=1
+  ```
+</ParamField>
+
+### Model Server Integration
+
+<ParamField path="PYWORKER_MODEL_SERVER_BASE_URL" type="string" default="http://127.0.0.1:18288">
+  Base URL of the ComfyUI API wrapper server.
+  
+  ```bash
+  PYWORKER_MODEL_SERVER_BASE_URL=http://127.0.0.1:18288
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_HEALTHCHECK_BASE_URL" type="string" default="MODEL_SERVER_BASE_URL">
+  Base URL for healthcheck endpoint. Defaults to `PYWORKER_MODEL_SERVER_BASE_URL` if not set.
+  
+  ```bash
+  PYWORKER_HEALTHCHECK_BASE_URL=http://127.0.0.1:18288
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_MODEL_HEALTHCHECK_ENDPOINT" type="string" default="/health">
+  Path to the model server healthcheck endpoint.
+  
+  ```bash
+  PYWORKER_MODEL_HEALTHCHECK_ENDPOINT=/health
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_READY_ROUTE" type="string" default="/readyz">
+  Route exposed by PyWorker for readiness checks.
+  
+  ```bash
+  PYWORKER_READY_ROUTE=/readyz
+  ```
+</ParamField>
+
+### LoRA Management
+
+<ParamField path="HF_LORA_REPO" type="string" default="Dylaaann/Lora">
+  HuggingFace repository for LoRA models.
+  
+  ```bash
+  HF_LORA_REPO=Dylaaann/Lora
+  ```
+</ParamField>
+
+<ParamField path="COMFY_LORA_DIR" type="string" default="/workspace/ComfyUI/models/loras">
+  Directory where LoRA files are stored.
+  
+  ```bash
+  COMFY_LORA_DIR=/workspace/ComfyUI/models/loras
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_REQUIRE_MANIFEST" type="string" default="auto">
+  Controls signed manifest requirement.
+  
+  - `auto`: Require manifests when `PYWORKER_MANIFEST_SECRET` is set
+  - `true` / `1` / `yes` / `on`: Always require signed manifests
+  - `false` / `0` / `no` / `off`: Never require signed manifests
+  
+  ```bash
+  PYWORKER_REQUIRE_MANIFEST=auto
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_MANIFEST_ENDPOINT" type="string" default="direct-instance">
+  Endpoint identifier that must match in manifest signatures.
+  
+  ```bash
+  PYWORKER_MANIFEST_ENDPOINT=direct-instance
+  ```
+</ParamField>
+
+<ParamField path="PYWORKER_MANIFEST_MAX_AGE_SECONDS" type="number" default="900">
+  Maximum age (in seconds) for manifest signatures. Manifests older than this are rejected.
+  
+  ```bash
+  PYWORKER_MANIFEST_MAX_AGE_SECONDS=900
+  ```
+</ParamField>
+
+### Provisioning
+
+<ParamField path="PROVISIONING_DONE_MARKER" type="string" default="/workspace/.provisioning-complete">
+  Path to the file created when provisioning completes successfully.
+  
+  ```bash
+  PROVISIONING_DONE_MARKER=/workspace/.provisioning-complete
+  ```
+</ParamField>
+
+<ParamField path="PROVISIONING_FAILED_MARKER" type="string" default="/workspace/.provisioning-failed">
+  Path to the file created when provisioning fails.
+  
+  ```bash
+  PROVISIONING_FAILED_MARKER=/workspace/.provisioning-failed
+  ```
+</ParamField>
+
+<ParamField path="PROVISIONING_WAIT_TIMEOUT_SECONDS" type="number" default="2700">
+  Maximum time (in seconds) to wait for provisioning to complete before timing out.
+  
+  ```bash
+  PROVISIONING_WAIT_TIMEOUT_SECONDS=2700
+  ```
+</ParamField>
+
+<ParamField path="PROVISIONING_WAIT_INTERVAL_SECONDS" type="number" default="5">
+  Interval (in seconds) between provisioning status checks.
+  
+  ```bash
+  PROVISIONING_WAIT_INTERVAL_SECONDS=5
+  ```
+</ParamField>
+
+<ParamField path="WAIT_FOR_PROVISIONING_MARKER" type="string" default="auto">
+  Controls whether to wait for provisioning completion.
+  
+  - `auto`: Wait if `PROVISIONING_SCRIPT` is set and `/.noprovisioning` doesn't exist
+  - `true`: Always wait
+  - `false`: Never wait
+  
+  ```bash
+  WAIT_FOR_PROVISIONING_MARKER=auto
+  ```
+</ParamField>
+
+<ParamField path="WORKSPACE" type="string" default="/workspace">
+  Root workspace directory used during provisioning.
+  
+  ```bash
+  WORKSPACE=/workspace
+  ```
+</ParamField>
+
+### Benchmarking
+
+<ParamField path="PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK" type="string" default="true">
+  Enable lightweight bootstrap ping benchmark for PyWorker startup.
+  
+  Accepts: `true`, `1`, `yes`, `on`, or `false`, `0`, `no`, `off`
+  
+  ```bash
+  PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK=true
+  ```
+</ParamField>
+
+### Server Configuration
+
+<ParamField path="WORKER_PORT" type="number" default="3000">
+  Port for the PyWorker HTTP server.
+  
+  ```bash
+  WORKER_PORT=3000
+  ```
+</ParamField>
+
+<ParamField path="REPORT_ADDR" type="string" default="https://run.vast.ai">
+  Vast.ai API endpoint for reporting worker status. Multiple addresses can be comma-separated.
+  
+  ```bash
+  REPORT_ADDR=https://run.vast.ai
+  ```
+</ParamField>
+
+<ParamField path="USE_SSL" type="string" default="true">
+  Enable SSL certificate generation and HTTPS.
+  
+  ```bash
+  USE_SSL=true
+  ```
+</ParamField>
+
+<ParamField path="MASTER_TOKEN" type="string">
+  Authentication token for Vast.ai worker status reporting.
+  
+  ```bash
+  MASTER_TOKEN=your-token-here
+  ```
+</ParamField>
+
+### SDK Configuration
+
+<ParamField path="SDK_BRANCH" type="string">
+  Install `vastai-sdk` from a specific branch, tag, or commit of the vast-sdk repository.
+  
+  Takes precedence over `SDK_VERSION`.
+  
+  ```bash
+  SDK_BRANCH=main
+  ```
+</ParamField>
+
+<ParamField path="SDK_VERSION" type="string">
+  Install a specific version of `vastai-sdk` from PyPI.
+  
+  Ignored if `SDK_BRANCH` is set.
+  
+  ```bash
+  SDK_VERSION=1.2.3
+  ```
+</ParamField>
+
+### Logging
+
+<ParamField path="MODEL_LOG" type="string" default="/var/log/portal/comfyui.log">
+  Path to the ComfyUI model server log file.
+  
+  ```bash
+  MODEL_LOG=/var/log/portal/comfyui.log
+  ```
+</ParamField>
+
+<ParamField path="ROTATE_MODEL_LOG" type="string" default="false">
+  Rotate model logs on startup (append to `.old` and truncate).
+  
+  ```bash
+  ROTATE_MODEL_LOG=true
+  ```
+</ParamField>
+
+## Example Configuration
+
+Here's a complete example for a Vast.ai template:
+
+```bash
+# Required
+BACKEND=comfyui-json
+PYWORKER_REPO=https://github.com/ByQwank/pyworker
+PROVISIONING_SCRIPT=https://raw.githubusercontent.com/ByQwank/pyworker/main/default.sh
+HF_TOKEN=hf_xxxxxxxxxxxxx
+PYWORKER_MANIFEST_SECRET=your-shared-secret
+
+# Optional overrides
+PYWORKER_REF=main
+PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK=true
+PROVISIONING_WAIT_TIMEOUT_SECONDS=3600
+```
+
+<Note>
+  Never commit secrets like `HF_TOKEN` or `PYWORKER_MANIFEST_SECRET` to version control. Keep them in Vast.ai template environment variables or runtime configuration.
+</Note>
+
+## Security Best Practices
+
+<Warning>
+  - Store all tokens and secrets in environment variables, never in code
+  - Use `PYWORKER_MANIFEST_SECRET` to enforce signed LoRA manifests
+  - Set `PYWORKER_REQUIRE_MANIFEST=true` in production to prevent unauthorized LoRA downloads
+  - Rotate `HF_TOKEN` and `PYWORKER_MANIFEST_SECRET` periodically
+</Warning>

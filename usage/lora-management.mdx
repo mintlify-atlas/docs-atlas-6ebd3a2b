@@ -1,0 +1,566 @@
+---
+title: LoRA Management
+description: Automatic LoRA downloading, manifest signing, and security features
+---
+
+## Overview
+
+PyWorker includes a sophisticated LoRA (Low-Rank Adaptation) management system that:
+
+- Automatically downloads LoRAs from HuggingFace
+- Validates and signs LoRA manifests for security
+- Extracts LoRA requirements from workflow JSON
+- Prevents unauthorized LoRA usage with signed manifests
+
+From `worker.py:75-94`, the system is configured via environment variables.
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# HuggingFace Repository
+HF_LORA_REPO="Dylaaann/Lora"        # Default LoRA repository
+HF_TOKEN="hf_xxxxxxxxxxxxx"         # HuggingFace access token (required)
+
+# Storage Location
+COMFY_LORA_DIR="/workspace/ComfyUI/models/loras"  # Default installation path
+
+# Security Settings
+PYWORKER_MANIFEST_SECRET="your-secret-key"         # HMAC signing secret
+PYWORKER_MANIFEST_MAX_AGE_SECONDS="900"            # Manifest expiry (15 min)
+PYWORKER_MANIFEST_ENDPOINT="direct-instance"       # Expected endpoint name
+PYWORKER_REQUIRE_MANIFEST="auto"                   # auto|true|false
+```
+
+### Manifest Security Modes
+
+From `worker.py:82-94`:
+
+```python
+# Auto mode: require manifests only when secret is configured
+PYWORKER_REQUIRE_MANIFEST="auto"  # Default
+
+# Always require signed manifests
+PYWORKER_REQUIRE_MANIFEST="true"
+
+# Never require manifests (development only)
+PYWORKER_REQUIRE_MANIFEST="false"
+```
+
+**Auto mode logic:**
+- If `PYWORKER_MANIFEST_SECRET` is set → manifests required
+- If `PYWORKER_MANIFEST_SECRET` is empty → manifests optional
+
+## Automatic LoRA Detection
+
+The worker automatically extracts LoRA requirements from workflow JSON.
+
+### Detection Logic
+
+From `worker.py:121-141`, the system scans for LoRA input fields:
+
+```python
+# Regex pattern for LoRA input keys
+LORA_INPUT_KEY_REGEX = r"^lora(?:_\d+)?_name$"
+
+# Matches:
+# - "lora_name"
+# - "lora_1_name"
+# - "lora_2_name"
+# etc.
+```
+
+**Example workflow node:**
+```json
+{
+  "10": {
+    "inputs": {
+      "lora_name": "anime_style_v2.safetensors",
+      "strength_model": 0.8,
+      "strength_clip": 0.8,
+      "model": ["4", 0],
+      "clip": ["4", 1]
+    },
+    "class_type": "LoraLoader"
+  }
+}
+```
+
+The system will detect `"anime_style_v2.safetensors"` and ensure it's available.
+
+### Filename Sanitization
+
+From `worker.py:106-118`:
+
+```python
+def sanitize_lora_name(value: str) -> str | None:
+    # Trim whitespace
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+
+    # Extract filename from path
+    normalized = trimmed.split("/")[-1].split("\\")[-1]
+    
+    # Ignore special values
+    if normalized.lower() in {"none", "null", ""}:
+        return None
+
+    # Validate .safetensors extension
+    if not re.fullmatch(r"[^/\\]+\.safetensors", normalized):
+        raise ValueError(f"Invalid LoRA filename '{value}'.")
+
+    return normalized
+```
+
+**Valid filenames:**
+- `model.safetensors`
+- `anime_style_v2.safetensors`
+- `my-custom-lora.safetensors`
+
+**Invalid filenames:**
+- `model.ckpt` (wrong extension)
+- `path/to/model.safetensors` (will be sanitized to `model.safetensors`)
+- `none`, `null`, `""` (ignored)
+
+## LoRA Download System
+
+### Automatic Download
+
+From `worker.py:203-238`, LoRAs are downloaded on-demand:
+
+```python
+def ensure_lora_downloaded(lora_name: str) -> Path:
+    COMFY_LORA_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = COMFY_LORA_DIR / lora_name
+    lock_path = COMFY_LORA_DIR / f"{lora_name}.lock"
+
+    # File-based locking for concurrent requests
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        # Skip if already downloaded
+        if target_path.exists():
+            return target_path
+
+        # Require HF_TOKEN for downloads
+        if not HF_TOKEN:
+            raise RuntimeError("HF_TOKEN is required to download LoRAs.")
+
+        # Download from HuggingFace
+        log.info("Downloading LoRA '%s' from '%s'", lora_name, HF_LORA_REPO)
+        downloaded_path = hf_hub_download(
+            repo_id=HF_LORA_REPO,
+            filename=lora_name,
+            repo_type="model",
+            local_dir=str(COMFY_LORA_DIR),
+            local_dir_use_symlinks=False,
+            token=HF_TOKEN,
+        )
+
+        # Move to target location if needed
+        downloaded_file = Path(downloaded_path)
+        if downloaded_file != target_path and not target_path.exists():
+            downloaded_file.replace(target_path)
+
+        if not target_path.exists():
+            raise RuntimeError(f"LoRA download finished but file is missing: {target_path}")
+
+    return target_path
+```
+
+### Download Features
+
+- **File locking**: Prevents duplicate downloads from concurrent requests
+- **Automatic retry**: Built into `hf_hub_download`
+- **Path validation**: Ensures file exists after download
+- **Local caching**: Reuses already-downloaded LoRAs
+
+### HuggingFace Setup
+
+**1. Create HuggingFace token:**
+- Go to https://huggingface.co/settings/tokens
+- Create a token with `read` access
+- Copy the token (starts with `hf_`)
+
+**2. Configure environment:**
+```bash
+export HF_TOKEN="hf_xxxxxxxxxxxxx"
+export HF_LORA_REPO="Dylaaann/Lora"  # Your repo
+```
+
+**3. Repository structure:**
+```
+YourUsername/Lora/
+├── anime_style_v2.safetensors
+├── portrait_lora.safetensors
+└── landscape_v1.safetensors
+```
+
+## Manifest System
+
+### Manifest Structure
+
+From `worker.py:144-200`:
+
+```json
+{
+  "generationId": "550e8400-e29b-41d4-a716-446655440000",
+  "endpoint": "direct-instance",
+  "issuedAt": 1709481600000,
+  "requiredLoras": [
+    "anime_style_v2.safetensors",
+    "portrait_lora.safetensors"
+  ],
+  "signature": "a1b2c3d4e5f6..."
+}
+```
+
+**Fields:**
+- `generationId`: Unique ID for this generation request
+- `endpoint`: Expected endpoint name (must match `PYWORKER_MANIFEST_ENDPOINT`)
+- `issuedAt`: Unix timestamp in milliseconds
+- `requiredLoras`: List of approved LoRA filenames
+- `signature`: HMAC-SHA256 signature of the payload
+
+### Signature Generation
+
+From `worker.py:185-198`:
+
+```python
+import hmac
+import hashlib
+import json
+
+def sign_manifest(manifest: dict, secret: str) -> str:
+    """Generate HMAC-SHA256 signature for manifest"""
+    payload_to_sign = {
+        "endpoint": manifest["endpoint"],
+        "generationId": manifest["generationId"],
+        "issuedAt": int(manifest["issuedAt"]),
+        "requiredLoras": sorted(manifest["requiredLoras"]),
+    }
+    
+    # Canonical JSON: sorted keys, no whitespace
+    canonical = json.dumps(
+        payload_to_sign,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True
+    )
+    
+    return hmac.new(
+        secret.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+```
+
+**Example signature generation:**
+
+```python
+import time
+import hmac
+import hashlib
+import json
+
+def create_signed_manifest(loras: list[str], secret: str) -> dict:
+    manifest = {
+        "generationId": "550e8400-e29b-41d4-a716-446655440000",
+        "endpoint": "direct-instance",
+        "issuedAt": int(time.time() * 1000),
+        "requiredLoras": sorted(loras),
+    }
+    
+    payload = {
+        "endpoint": manifest["endpoint"],
+        "generationId": manifest["generationId"],
+        "issuedAt": manifest["issuedAt"],
+        "requiredLoras": manifest["requiredLoras"],
+    }
+    
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    
+    manifest["signature"] = signature
+    return manifest
+
+# Usage:
+manifest = create_signed_manifest(
+    ["anime_style_v2.safetensors", "portrait_lora.safetensors"],
+    "your-secret-key"
+)
+```
+
+### Manifest Validation
+
+From `worker.py:144-200`, the worker validates:
+
+1. **Structure**: All required fields present and correct types
+2. **Endpoint**: Matches `PYWORKER_MANIFEST_ENDPOINT`
+3. **Timestamp**: Not expired (within `MANIFEST_MAX_AGE_SECONDS`)
+4. **Signature**: HMAC matches expected value
+
+```python
+# Age validation
+age_ms = abs(int(time.time() * 1000) - int(manifest["issuedAt"]))
+if age_ms > MANIFEST_MAX_AGE_SECONDS * 1000:
+    raise ValueError("lora_manifest signature expired.")
+
+# Signature validation
+if not hmac.compare_digest(expected_signature, manifest["signature"]):
+    raise ValueError("lora_manifest signature mismatch.")
+```
+
+### Using Signed Manifests
+
+Include the manifest in your request:
+
+```json
+{
+  "input": {
+    "workflow_json": { ... },
+    "lora_manifest": {
+      "generationId": "550e8400-e29b-41d4-a716-446655440000",
+      "endpoint": "direct-instance",
+      "issuedAt": 1709481600000,
+      "requiredLoras": [
+        "anime_style_v2.safetensors"
+      ],
+      "signature": "a1b2c3d4e5f6..."
+    }
+  }
+}
+```
+
+## Request Processing
+
+### LoRA Requirements Flow
+
+From `worker.py:241-302`, the `ensure_required_loras` function:
+
+1. **Extract workflow LoRAs**: Scan workflow JSON for LoRA inputs
+2. **Parse manifest**: Validate signed manifest if provided
+3. **Merge requirements**: Combine workflow + manifest + explicit list
+4. **Validate against manifest**: Ensure no unauthorized LoRAs (if manifest enabled)
+5. **Download**: Fetch missing LoRAs from HuggingFace
+6. **Update payload**: Add `required_loras` list to request
+
+```python
+# Priority order:
+# 1. Workflow JSON lora_name fields (auto-detected)
+# 2. input.required_loras (explicit list)
+# 3. input.lora_manifest.requiredLoras (signed list)
+
+# With manifest signing enabled:
+# - Workflow can only use LoRAs approved in manifest
+# - Unexpected LoRAs are rejected
+
+# Without manifest signing:
+# - All detected LoRAs are allowed
+```
+
+### Explicit LoRA List
+
+You can manually specify LoRAs:
+
+```json
+{
+  "input": {
+    "workflow_json": { ... },
+    "required_loras": [
+      "anime_style_v2.safetensors",
+      "portrait_lora.safetensors"
+    ]
+  }
+}
+```
+
+From `worker.py:254-264`:
+```python
+requested_loras_raw = input_payload.get("required_loras")
+if requested_loras_raw is not None:
+    if not isinstance(requested_loras_raw, list):
+        raise ValueError("input.required_loras must be an array when provided.")
+    for entry in requested_loras_raw:
+        if not isinstance(entry, str):
+            raise ValueError("input.required_loras entries must be strings.")
+```
+
+### Security Enforcement
+
+From `worker.py:280-290`, when manifests are required:
+
+```python
+if MANIFEST_SECRET and manifest_loras:
+    approved = set(manifest_loras)
+    unexpected = sorted(name for name in required_set if name not in approved)
+    if unexpected:
+        raise ValueError(
+            "Workflow requested LoRAs not allowed by signed manifest: "
+            + ", ".join(unexpected)
+        )
+    required_set = approved
+```
+
+**Example error:**
+```
+ValueError: Workflow requested LoRAs not allowed by signed manifest: unauthorized_lora.safetensors
+```
+
+## Logging
+
+From `worker.py:294-298`, successful LoRA preparation is logged:
+
+```python
+if required_loras:
+    log.info("LoRA set ready (%d): %s", len(required_loras), ", ".join(required_loras))
+```
+
+**Example output:**
+```
+INFO - Downloading LoRA 'anime_style_v2.safetensors' from 'Dylaaann/Lora'
+INFO - LoRA set ready (2): anime_style_v2.safetensors, portrait_lora.safetensors
+```
+
+## Best Practices
+
+### Development
+
+- Disable manifest signing: `PYWORKER_REQUIRE_MANIFEST=false`
+- Use public HuggingFace repos for testing
+- Keep LoRA files under 2GB for faster downloads
+
+### Production
+
+- **Always enable manifest signing**: Set `PYWORKER_MANIFEST_SECRET`
+- Use short expiry times: `PYWORKER_MANIFEST_MAX_AGE_SECONDS=300` (5 min)
+- Rotate manifest secrets regularly
+- Monitor unauthorized LoRA attempts
+- Use private HuggingFace repos
+
+### Performance
+
+- Pre-download common LoRAs to `COMFY_LORA_DIR`
+- Use fast storage for LoRA directory
+- Monitor disk space usage
+- Consider LoRA caching strategies
+
+### Security
+
+- Keep `PYWORKER_MANIFEST_SECRET` confidential
+- Never commit secrets to git
+- Use environment variables or secret managers
+- Validate manifest endpoint matches deployment
+- Set appropriate token permissions on HuggingFace
+
+## Error Handling
+
+### Common Errors
+
+**Missing HF_TOKEN:**
+```
+RuntimeError: HF_TOKEN is required to download LoRAs.
+```
+
+**Invalid filename:**
+```
+ValueError: Invalid LoRA filename 'model.ckpt'.
+```
+
+**Manifest required but missing:**
+```
+ValueError: Signed lora_manifest is required but missing.
+```
+
+**Signature expired:**
+```
+ValueError: lora_manifest signature expired.
+```
+
+**Signature mismatch:**
+```
+ValueError: lora_manifest signature mismatch.
+```
+
+**Unauthorized LoRA:**
+```
+ValueError: Workflow requested LoRAs not allowed by signed manifest: unauthorized.safetensors
+```
+
+## Complete Example
+
+### With Signed Manifest
+
+```python
+import time
+import hmac
+import hashlib
+import json
+import uuid
+from vastai import Serverless
+
+# 1. Create signed manifest
+def create_manifest(loras: list[str], secret: str) -> dict:
+    manifest = {
+        "generationId": str(uuid.uuid4()),
+        "endpoint": "direct-instance",
+        "issuedAt": int(time.time() * 1000),
+        "requiredLoras": sorted(loras),
+    }
+    
+    payload = {
+        "endpoint": manifest["endpoint"],
+        "generationId": manifest["generationId"],
+        "issuedAt": manifest["issuedAt"],
+        "requiredLoras": manifest["requiredLoras"],
+    }
+    
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    
+    manifest["signature"] = signature
+    return manifest
+
+# 2. Send request with manifest
+async def generate_with_lora():
+    secret = "your-secret-key"
+    loras = ["anime_style_v2.safetensors"]
+    
+    manifest = create_manifest(loras, secret)
+    
+    async with Serverless() as client:
+        endpoint = await client.get_endpoint(name="my-comfyui-endpoint")
+        
+        payload = {
+            "input": {
+                "request_id": str(uuid.uuid4()),
+                "workflow_json": {
+                    "10": {
+                        "inputs": {
+                            "lora_name": "anime_style_v2.safetensors",
+                            "strength_model": 0.8,
+                            "strength_clip": 0.8,
+                            "model": ["4", 0],
+                            "clip": ["4", 1]
+                        },
+                        "class_type": "LoraLoader"
+                    },
+                    # ... other nodes
+                },
+                "lora_manifest": manifest,
+            }
+        }
+        
+        response = await endpoint.request("/generate/sync", payload, cost=100)
+        return response
+```

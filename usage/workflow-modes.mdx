@@ -1,0 +1,441 @@
+---
+title: Workflow Modes
+description: Choose between modifier mode and custom workflow mode for ComfyUI generation
+---
+
+## Overview
+
+PyWorker supports two modes for ComfyUI generation:
+
+1. **Modifier Mode**: Use predefined workflow modifiers with simple parameters
+2. **Custom Workflow Mode**: Submit complete ComfyUI workflow JSON
+
+You must choose **one mode per request** - you cannot use both simultaneously.
+
+## Modifier Mode
+
+Modifier mode uses predefined workflow templates that are easier to work with for common use cases.
+
+### Structure
+
+From `README.md:125-141`:
+
+```json
+{
+  "input": {
+    "request_id": "uuid-string",
+    "modifier": "Text2Image",
+    "modifications": {
+      "prompt": "a beautiful landscape",
+      "width": 1024,
+      "height": 1024,
+      "steps": 20,
+      "seed": 123456789
+    }
+  }
+}
+```
+
+### Available Modifiers
+
+<AccordionGroup>
+  <Accordion title="Text2Image">
+    Generate images from text prompts using stable diffusion.
+
+    **Parameters:**
+    - `prompt` (string): Text description of the image to generate
+    - `width` (int): Image width in pixels (default: 512)
+    - `height` (int): Image height in pixels (default: 512)
+    - `steps` (int): Number of denoising steps (default: 20)
+    - `seed` (int): Random seed for reproducibility
+
+    **Example:**
+    ```json
+    {
+      "input": {
+        "modifier": "Text2Image",
+        "modifications": {
+          "prompt": "a cat sitting on a windowsill, oil painting",
+          "width": 768,
+          "height": 768,
+          "steps": 25,
+          "seed": 42
+        }
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="RawWorkflow">
+    Use the raw workflow modifier for custom workflow logic.
+
+    **Parameters:**
+    - Varies based on workflow configuration
+    - Typically includes `prompt`, `width`, `height`, `steps`, `seed`
+
+    **Example:**
+    ```json
+    {
+      "input": {
+        "modifier": "RawWorkflow",
+        "modifications": {
+          "prompt": "a beautiful landscape",
+          "width": 1024,
+          "height": 1024,
+          "steps": 20,
+          "seed": 123456789
+        }
+      }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Using Modifier Mode (SDK)
+
+From `client.py:55-80`:
+
+```python
+import uuid
+from vastai import Serverless
+
+async def call_generate(
+    client: Serverless,
+    *,
+    endpoint_name: str,
+    prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    seed: int,
+) -> dict:
+    """Generate image using Text2Image modifier"""
+    endpoint = await client.get_endpoint(name=endpoint_name)
+    
+    payload = {
+        "input": {
+            "request_id": str(uuid.uuid4()),
+            "modifier": "Text2Image",
+            "modifications": {
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "seed": seed,
+            },
+        }
+    }
+    
+    return await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+### Advantages of Modifier Mode
+
+- Simple, clean API with fewer parameters
+- Built-in validation for common use cases
+- Easier to maintain and version
+- Less error-prone than raw JSON
+
+### When to Use Modifier Mode
+
+- Standard text-to-image generation
+- Predictable, repeatable workflows
+- When you don't need custom ComfyUI nodes
+- Rapid prototyping and testing
+
+## Custom Workflow Mode
+
+Custom workflow mode allows you to submit complete ComfyUI workflow JSON for maximum flexibility.
+
+### Structure
+
+From `README.md:144-156`:
+
+```json
+{
+  "input": {
+    "request_id": "uuid-string",
+    "workflow_json": {
+      "3": {
+        "inputs": {
+          "seed": 42,
+          "steps": 20,
+          "cfg": 8,
+          "sampler_name": "euler",
+          "scheduler": "normal",
+          "denoise": 1,
+          "model": ["4", 0],
+          "positive": ["6", 0],
+          "negative": ["7", 0],
+          "latent_image": ["5", 0]
+        },
+        "class_type": "KSampler"
+      },
+      "4": {
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        },
+        "class_type": "CheckpointLoaderSimple"
+      }
+      // ... additional nodes
+    }
+  }
+}
+```
+
+### Using Custom Workflow Mode (SDK)
+
+From `client.py:83-97`:
+
+```python
+import json
+import uuid
+from vastai import Serverless
+
+async def call_generate_workflow(
+    client: Serverless,
+    *,
+    endpoint_name: str,
+    workflow_json: dict,
+) -> dict:
+    """Generate using custom workflow JSON"""
+    endpoint = await client.get_endpoint(name=endpoint_name)
+    
+    payload = {
+        "input": {
+            "request_id": str(uuid.uuid4()),
+            "workflow_json": workflow_json,
+        }
+    }
+    
+    return await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+### Loading Workflow from File
+
+From `client.py:221-256`:
+
+```python
+import json
+import os
+
+async def demo_workflow(client: Serverless, workflow_file: str):
+    """Demo: Generate using custom workflow file"""
+    
+    if not os.path.exists(workflow_file):
+        raise FileNotFoundError(f"Workflow file not found: {workflow_file}")
+
+    # Load workflow JSON
+    with open(workflow_file, "r") as f:
+        workflow_json = json.load(f)
+
+    print(f"Loaded workflow: {workflow_file}")
+    
+    # Generate
+    response = await call_generate_workflow(
+        client,
+        endpoint_name="my-comfyui-endpoint",
+        workflow_json=workflow_json,
+    )
+    
+    # Extract and save image
+    worker_url = response.get("url", "")
+    if "response" in response:
+        filename = extract_filename(response["response"])
+        if filename:
+            await download_image(worker_url, filename, "workflow.png")
+```
+
+### Workflow JSON Format
+
+ComfyUI workflows are structured as a dictionary of nodes:
+
+```json
+{
+  "node_id": {
+    "inputs": {
+      "parameter_name": value,
+      "connected_input": ["source_node_id", output_index]
+    },
+    "class_type": "NodeClassName"
+  }
+}
+```
+
+**Key elements:**
+- **Node ID**: String or numeric identifier for the node
+- **inputs**: Dictionary of parameters and connections
+- **class_type**: ComfyUI node class name (e.g., "KSampler", "CheckpointLoaderSimple")
+- **Connections**: Array format `["source_node", output_index]`
+
+### Example: Complete Workflow
+
+From `README.md:243-267`:
+
+```json
+{
+  "input": {
+    "request_id": "67890",
+    "workflow_json": {
+      "3": {
+        "inputs": {
+          "seed": 42,
+          "steps": 20,
+          "cfg": 8,
+          "sampler_name": "euler",
+          "scheduler": "normal",
+          "denoise": 1,
+          "model": ["4", 0],
+          "positive": ["6", 0],
+          "negative": ["7", 0],
+          "latent_image": ["5", 0]
+        },
+        "class_type": "KSampler"
+      },
+      "4": {
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        },
+        "class_type": "CheckpointLoaderSimple"
+      },
+      "5": {
+        "inputs": {
+          "width": 1024,
+          "height": 1024,
+          "batch_size": 1
+        },
+        "class_type": "EmptyLatentImage"
+      },
+      "6": {
+        "inputs": {
+          "text": "a beautiful sunset over mountains",
+          "clip": ["4", 1]
+        },
+        "class_type": "CLIPTextEncode"
+      },
+      "7": {
+        "inputs": {
+          "text": "blurry, low quality",
+          "clip": ["4", 1]
+        },
+        "class_type": "CLIPTextEncode"
+      },
+      "8": {
+        "inputs": {
+          "samples": ["3", 0],
+          "vae": ["4", 2]
+        },
+        "class_type": "VAEDecode"
+      },
+      "9": {
+        "inputs": {
+          "filename_prefix": "ComfyUI",
+          "images": ["8", 0]
+        },
+        "class_type": "SaveImage"
+      }
+    }
+  }
+}
+```
+
+### Advantages of Custom Workflow Mode
+
+- Full control over ComfyUI pipeline
+- Access to all ComfyUI nodes and features
+- Support for custom nodes and extensions
+- Complex multi-stage workflows
+- Video generation, upscaling, etc.
+
+### When to Use Custom Workflow Mode
+
+- Advanced ComfyUI features
+- Custom node implementations
+- Multi-stage processing pipelines
+- Video generation workflows
+- Fine-grained control over every parameter
+
+## Workload Estimation
+
+The worker automatically calculates workload cost for routing based on the workflow.
+
+From `worker.py:392-456`, the workload calculator:
+- Parses workflow JSON from either mode
+- Extracts dimensions, steps, and frames
+- Calculates base workload: `grid_w * grid_h * frames * steps`
+- Applies multipliers for RIFE, upscaling, video processing
+
+```python
+# Default values
+DEFAULT_WIDTH = 432
+DEFAULT_HEIGHT = 768
+DEFAULT_FRAMES = 17
+DEFAULT_STEPS = 8
+
+# Multipliers
+WORKLOAD_MULTIPLIER = 0.6  # Base multiplier
+# RIFE: 1.35x
+# Upscale: 1.25x
+# Multiple video combines: 1 + (count - 1) * 0.15
+```
+
+This happens automatically - you don't need to calculate workload manually.
+
+## CLI Usage
+
+### Modifier Mode (CLI)
+
+```bash
+python -m workers.comfyui-json.client \
+  --prompt "a beautiful sunset" \
+  --width 1024 \
+  --height 768 \
+  --steps 30 \
+  --seed 42
+```
+
+### Custom Workflow Mode (CLI)
+
+```bash
+python -m workers.comfyui-json.client --workflow my_workflow.json
+```
+
+From `README.md:56-58`:
+```bash
+# Using a custom workflow file
+python -m workers.comfyui-json.client --workflow my_workflow.json
+```
+
+## Comparison
+
+| Feature | Modifier Mode | Custom Workflow Mode |
+|---------|---------------|---------------------|
+| Complexity | Low | High |
+| Flexibility | Limited | Full |
+| Validation | Built-in | Manual |
+| Use cases | Standard generation | Advanced features |
+| Parameters | Simple dict | Full ComfyUI JSON |
+| Custom nodes | No | Yes |
+| Learning curve | Easy | Requires ComfyUI knowledge |
+| Error handling | Clearer | More verbose |
+
+## Best Practices
+
+### For Modifier Mode:
+- Use for standard text-to-image workflows
+- Keep modifications simple and predictable
+- Leverage built-in validation
+- Good for API integration
+
+### For Custom Workflow Mode:
+- Export workflows from ComfyUI UI
+- Test workflows locally before deployment
+- Include all required nodes and connections
+- Document complex workflows
+- Version control your workflow files
+
+### General:
+- Always include a `request_id` for tracking
+- Use appropriate seeds for reproducibility
+- Test with small dimensions first
+- Monitor workload costs for routing

@@ -1,0 +1,301 @@
+---
+title: "LoRA Manifest Signing"
+description: "HMAC-SHA256 signature verification for LoRA manifests in PyWorker"
+---
+
+## Overview
+
+PyWorker implements a cryptographic signing system for LoRA manifests using HMAC-SHA256 to prevent unauthorized model downloads and ensure request integrity. This prevents malicious actors from requesting arbitrary LoRA models that aren't approved for a specific generation.
+
+## How Manifest Signing Works
+
+### Signature Generation
+
+The manifest signing process uses HMAC (Hash-based Message Authentication Code) with SHA-256 to create tamper-proof signatures.
+
+#### Canonical Payload
+
+Before signing, the manifest data is converted to canonical JSON format:
+
+```python
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+```
+
+The payload must include these exact fields in sorted order:
+
+```json
+{
+  "endpoint": "direct-instance",
+  "generationId": "unique-generation-id",
+  "issuedAt": 1709481234000,
+  "requiredLoras": ["model1.safetensors", "model2.safetensors"]
+}
+```
+
+#### HMAC Signature
+
+The signature is generated using the secret key and canonical JSON:
+
+```python
+import hmac
+import hashlib
+
+payload_to_sign = {
+    "endpoint": endpoint,
+    "generationId": generation_id,
+    "issuedAt": int(issued_at),
+    "requiredLoras": required_loras,
+}
+
+signature = hmac.new(
+    MANIFEST_SECRET.encode("utf-8"),
+    canonical_json(payload_to_sign).encode("utf-8"),
+    hashlib.sha256,
+).hexdigest()
+```
+
+### Verification Process
+
+The `parse_and_verify_manifest()` function in `worker.py` performs comprehensive validation:
+
+```python
+def parse_and_verify_manifest(manifest: dict[str, Any]) -> list[str]:
+    # Extract required fields
+    generation_id = manifest.get("generationId")
+    endpoint = manifest.get("endpoint")
+    issued_at = manifest.get("issuedAt")
+    signature = manifest.get("signature")
+    required = manifest.get("requiredLoras")
+    
+    # Validate field presence and types
+    if not isinstance(generation_id, str) or not generation_id:
+        raise ValueError("lora_manifest.generationId must be a non-empty string.")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("lora_manifest.endpoint must be a non-empty string.")
+    if not isinstance(issued_at, (int, float)):
+        raise ValueError("lora_manifest.issuedAt must be a number.")
+    if not isinstance(signature, str) or not signature:
+        raise ValueError(
+            "lora_manifest.signature is required when PYWORKER_MANIFEST_SECRET is set."
+        )
+    
+    # Check timestamp freshness
+    age_ms = abs(int(time.time() * 1000) - int(issued_at))
+    if age_ms > MANIFEST_MAX_AGE_SECONDS * 1000:
+        raise ValueError("lora_manifest signature expired.")
+    
+    # Reconstruct payload and verify signature
+    payload_to_sign = {
+        "endpoint": endpoint,
+        "generationId": generation_id,
+        "issuedAt": int(issued_at),
+        "requiredLoras": required_loras,
+    }
+    expected_signature = hmac.new(
+        MANIFEST_SECRET.encode("utf-8"),
+        canonical_json(payload_to_sign).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    
+    # Timing-safe comparison
+    if not hmac.compare_digest(expected_signature, signature):
+        raise ValueError("lora_manifest signature mismatch.")
+    
+    return required_loras
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PYWORKER_MANIFEST_SECRET` | Conditional | `""` | Shared HMAC secret key for signing/verifying manifests |
+| `PYWORKER_REQUIRE_MANIFEST` | No | `"auto"` | `auto`: require when secret set<br/>`true`: always require<br/>`false`: never require |
+| `PYWORKER_MANIFEST_MAX_AGE_SECONDS` | No | `900` | Maximum manifest age (15 minutes) |
+| `PYWORKER_MANIFEST_ENDPOINT` | No | `"direct-instance"` | Expected endpoint value in manifest |
+
+<Warning>
+  When `PYWORKER_REQUIRE_MANIFEST=true` but `PYWORKER_MANIFEST_SECRET` is not set, PyWorker will fail to start with:
+  
+  ```
+  RuntimeError: PYWORKER_REQUIRE_MANIFEST is enabled but PYWORKER_MANIFEST_SECRET is not configured.
+  ```
+</Warning>
+
+### Auto Mode Behavior
+
+By default (`PYWORKER_REQUIRE_MANIFEST=auto`), signature verification is automatically enabled when a secret is configured:
+
+```python
+_require_manifest_raw = os.getenv("PYWORKER_REQUIRE_MANIFEST", "auto").strip().lower()
+if _require_manifest_raw in {"1", "true", "yes", "on"}:
+    REQUIRE_SIGNED_MANIFEST = True
+elif _require_manifest_raw in {"0", "false", "no", "off"}:
+    REQUIRE_SIGNED_MANIFEST = False
+else:
+    # Auto: require signed manifests whenever a verification secret is configured.
+    REQUIRE_SIGNED_MANIFEST = bool(MANIFEST_SECRET)
+```
+
+## Request Format
+
+Clients send the signed manifest in the `lora_manifest` field:
+
+```json
+{
+  "input": {
+    "workflow_json": { ... },
+    "lora_manifest": {
+      "generationId": "gen_abc123",
+      "endpoint": "direct-instance",
+      "issuedAt": 1709481234000,
+      "requiredLoras": ["style_lora.safetensors"],
+      "signature": "a3f5b2c1d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2"
+    }
+  }
+}
+```
+
+## Security Features
+
+### Timing Attack Protection
+
+The verification uses `hmac.compare_digest()` for constant-time string comparison:
+
+```python
+if not hmac.compare_digest(expected_signature, signature):
+    raise ValueError("lora_manifest signature mismatch.")
+```
+
+### Timestamp Validation
+
+Manifests expire after a configurable time window (default 15 minutes):
+
+```python
+age_ms = abs(int(time.time() * 1000) - int(issued_at))
+if age_ms > MANIFEST_MAX_AGE_SECONDS * 1000:
+    raise ValueError("lora_manifest signature expired.")
+```
+
+### Endpoint Verification
+
+The manifest must be issued for the correct endpoint:
+
+```python
+if MANIFEST_ENDPOINT and endpoint != MANIFEST_ENDPOINT:
+    raise ValueError(
+        f"lora_manifest.endpoint mismatch. expected='{MANIFEST_ENDPOINT}' got='{endpoint}'"
+    )
+```
+
+### LoRA Whitelist Enforcement
+
+When a signed manifest is provided, PyWorker rejects any LoRAs not in the approved list:
+
+```python
+if MANIFEST_SECRET and manifest_loras:
+    approved = set(manifest_loras)
+    unexpected = sorted(name for name in required_set if name not in approved)
+    if unexpected:
+        raise ValueError(
+            "Workflow requested LoRAs not allowed by signed manifest: "
+            + ", ".join(unexpected)
+        )
+```
+
+<Warning>
+  The manifest secret must be identical on both the signing service (Trigger) and all PyWorker instances. Mismatched secrets will cause all requests to fail with signature verification errors.
+</Warning>
+
+## Example: Generating a Signed Manifest
+
+Here's a complete example of generating a signed manifest:
+
+```python
+import hmac
+import hashlib
+import json
+import time
+from typing import Any
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+def create_signed_manifest(
+    generation_id: str,
+    required_loras: list[str],
+    secret: str,
+    endpoint: str = "direct-instance"
+) -> dict:
+    # Sort and deduplicate LoRAs
+    loras_sorted = sorted(set(required_loras))
+    
+    # Create timestamp (milliseconds)
+    issued_at = int(time.time() * 1000)
+    
+    # Build canonical payload
+    payload = {
+        "endpoint": endpoint,
+        "generationId": generation_id,
+        "issuedAt": issued_at,
+        "requiredLoras": loras_sorted,
+    }
+    
+    # Generate signature
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    
+    # Return complete manifest
+    return {
+        "generationId": generation_id,
+        "endpoint": endpoint,
+        "issuedAt": issued_at,
+        "requiredLoras": loras_sorted,
+        "signature": signature,
+    }
+
+# Usage
+manifest = create_signed_manifest(
+    generation_id="gen_xyz789",
+    required_loras=["anime_style.safetensors", "character_lora.safetensors"],
+    secret="your-shared-secret-key"
+)
+```
+
+## Troubleshooting
+
+### Signature Mismatch
+
+**Error:** `ValueError: lora_manifest signature mismatch.`
+
+**Causes:**
+- Secret key mismatch between signing service and worker
+- Payload modified after signing
+- Different canonical JSON formatting
+- LoRA list not sorted before signing
+
+### Expired Manifest
+
+**Error:** `ValueError: lora_manifest signature expired.`
+
+**Causes:**
+- Manifest older than `PYWORKER_MANIFEST_MAX_AGE_SECONDS`
+- Clock skew between signing service and worker
+- Timestamp in wrong format (should be milliseconds)
+
+**Solution:** Increase `PYWORKER_MANIFEST_MAX_AGE_SECONDS` or ensure clocks are synchronized.
+
+### Missing Signature
+
+**Error:** `ValueError: Signed lora_manifest is required but missing.`
+
+**Causes:**
+- `PYWORKER_REQUIRE_MANIFEST=true` but no manifest provided
+- `PYWORKER_MANIFEST_SECRET` is set (auto mode) but no manifest sent
+
+**Solution:** Always include a signed `lora_manifest` in requests when verification is enabled.

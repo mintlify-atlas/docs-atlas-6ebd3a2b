@@ -1,0 +1,168 @@
+---
+title: 'WorkerConfig'
+description: 'Configuration object for initializing a PyWorker instance'
+---
+
+The `WorkerConfig` object configures the PyWorker runtime, including model server connection details, handler routes, and log monitoring behavior.
+
+## Usage
+
+```python
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig
+
+worker_config = WorkerConfig(
+    model_server_url="http://127.0.0.1",
+    model_server_port=18288,
+    model_log_file="/var/log/portal/comfyui.log",
+    model_healthcheck_url="/health",
+    handlers=[...],
+    log_action_config=LogActionConfig(...)
+)
+
+Worker(worker_config).run()
+```
+
+## Configuration Fields
+
+<ParamField path="model_server_url" type="str" required>
+  The base URL of the model server (e.g., ComfyUI API wrapper).
+  
+  Example: `"http://127.0.0.1"`
+  
+  <Note>
+    This should only include the scheme and hostname, without the port number.
+  </Note>
+</ParamField>
+
+<ParamField path="model_server_port" type="int" required>
+  The port number where the model server is listening.
+  
+  Example: `18288`
+  
+  Defaults to port 80 for HTTP or 443 for HTTPS if not specified in the URL.
+</ParamField>
+
+<ParamField path="model_log_file" type="str" required>
+  Absolute path to the model server's log file that PyWorker should monitor.
+  
+  Example: `"/var/log/portal/comfyui.log"`
+  
+  PyWorker monitors this file for load completion, errors, and informational messages based on the `log_action_config`.
+</ParamField>
+
+<ParamField path="model_healthcheck_url" type="str">
+  The endpoint path for model server health checks.
+  
+  Example: `"/health"`
+  
+  Default: `"/health"`
+  
+  PyWorker uses this endpoint to verify the model server is ready before accepting requests.
+</ParamField>
+
+<ParamField path="handlers" type="list[HandlerConfig]" required>
+  List of handler configurations defining the API routes and their behavior.
+  
+  Each handler specifies a route, processing logic, and performance characteristics. See [HandlerConfig](/api/handler-config) for details.
+  
+  Example:
+  ```python
+  handlers=[
+      HandlerConfig(
+          route="/generate/sync",
+          allow_parallel_requests=False,
+          max_queue_time=0.0,
+          request_parser=ensure_required_loras,
+          workload_calculator=workload_calculator,
+      ),
+  ]
+  ```
+</ParamField>
+
+<ParamField path="log_action_config" type="LogActionConfig">
+  Configuration for log pattern matching and actions.
+  
+  Defines which log messages indicate model load completion, errors, or informational events.
+  
+  Example:
+  ```python
+  log_action_config=LogActionConfig(
+      on_load=["To see the GUI go to: "],
+      on_error=["MetadataIncompleteBuffer", "[ERROR] Provisioning Script failed"],
+      on_info=['"message":"Downloading']
+  )
+  ```
+  
+  **Fields:**
+  - `on_load` (list[str]): Log message patterns that indicate the model has finished loading
+  - `on_error` (list[str]): Log message patterns that indicate errors
+  - `on_info` (list[str]): Log message patterns for informational messages
+</ParamField>
+
+## Complete Example
+
+From `workers/comfyui-json/worker.py`:
+
+```python
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
+
+MODEL_SERVER_URL = "http://127.0.0.1"
+MODEL_SERVER_PORT = 18288
+MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
+MODEL_HEALTHCHECK_ENDPOINT = "/health"
+READY_ROUTE = "/readyz"
+MAX_QUEUE_TIME = 0.0
+
+worker_config = WorkerConfig(
+    model_server_url=MODEL_SERVER_URL,
+    model_server_port=MODEL_SERVER_PORT,
+    model_log_file=MODEL_LOG_FILE,
+    model_healthcheck_url=MODEL_HEALTHCHECK_ENDPOINT,
+    handlers=[
+        HandlerConfig(
+            route="/benchmark/ping",
+            allow_parallel_requests=True,
+            max_queue_time=MAX_QUEUE_TIME,
+            benchmark_config=BenchmarkConfig(
+                generator=bootstrap_ping_generator,
+                runs=1,
+                concurrency=1,
+                do_warmup=False,
+            ),
+            remote_function=bootstrap_ping_remote,
+        ),
+        HandlerConfig(
+            route=READY_ROUTE,
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=None,
+            remote_function=readyz_remote,
+        ),
+        HandlerConfig(
+            route="/generate/sync",
+            allow_parallel_requests=False,
+            max_queue_time=MAX_QUEUE_TIME,
+            request_parser=ensure_required_loras,
+            workload_calculator=workload_calculator,
+            benchmark_config=None,
+        ),
+    ],
+    log_action_config=LogActionConfig(
+        on_load=["To see the GUI go to: "],
+        on_error=[
+            "MetadataIncompleteBuffer",
+            "[ERROR] Provisioning Script failed",
+        ],
+        on_info=['"message":"Downloading']
+    )
+)
+
+# Filter out None handlers before starting
+worker_config.handlers = [h for h in worker_config.handlers if h is not None]
+
+Worker(worker_config).run()
+```
+
+## See Also
+
+- [HandlerConfig](/api/handler-config) - Configure individual request handlers

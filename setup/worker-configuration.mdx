@@ -1,0 +1,615 @@
+---
+title: Worker Configuration
+description: Configure PyWorker behavior with WorkerConfig, HandlerConfig, and performance tuning
+---
+
+## Overview
+
+PyWorker uses the Vast.ai SDK's configuration objects to define worker behavior, routing, benchmarking, and workload calculation. The worker is configured in `worker.py` with `WorkerConfig` and multiple `HandlerConfig` objects.
+
+## WorkerConfig
+
+The main worker configuration object defines how PyWorker integrates with the ComfyUI model server.
+
+```python
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
+
+worker_config = WorkerConfig(
+    model_server_url=MODEL_SERVER_URL,
+    model_server_port=MODEL_SERVER_PORT,
+    model_log_file=MODEL_LOG_FILE,
+    model_healthcheck_url=MODEL_HEALTHCHECK_ENDPOINT,
+    handlers=[...],
+    log_action_config=LogActionConfig(...)
+)
+```
+
+### Parameters
+
+<ParamField path="model_server_url" type="string" required>
+  Base URL scheme and hostname of the ComfyUI API wrapper.
+  
+  Parsed from `PYWORKER_MODEL_SERVER_BASE_URL` (default: `http://127.0.0.1:18288`).
+  
+  Example: `http://127.0.0.1` (port specified separately)
+</ParamField>
+
+<ParamField path="model_server_port" type="int" required>
+  Port number of the ComfyUI API wrapper.
+  
+  Parsed from `PYWORKER_MODEL_SERVER_BASE_URL` (default: `18288`).
+  
+  Example: `18288`
+</ParamField>
+
+<ParamField path="model_log_file" type="string" required>
+  Path to the ComfyUI log file that PyWorker monitors for load/error messages.
+  
+  Default: `/var/log/portal/comfyui.log`
+</ParamField>
+
+<ParamField path="model_healthcheck_url" type="string" required>
+  Endpoint path for healthcheck requests (combined with `model_server_url:model_server_port`).
+  
+  Default: `/health`
+</ParamField>
+
+<ParamField path="handlers" type="list[HandlerConfig]" required>
+  List of route handlers. Each handler defines a route, its behavior, and optional benchmark configuration.
+  
+  See [HandlerConfig](#handlerconfig) for details.
+</ParamField>
+
+<ParamField path="log_action_config" type="LogActionConfig" required>
+  Defines log patterns that trigger specific actions (model loaded, errors, info messages).
+  
+  See [LogActionConfig](#logactionconfig) for details.
+</ParamField>
+
+### URL Parsing
+
+The worker parses `PYWORKER_MODEL_SERVER_BASE_URL` to extract components:
+
+```python
+MODEL_SERVER_BASE_URL = os.getenv(
+    "PYWORKER_MODEL_SERVER_BASE_URL", 
+    "http://127.0.0.1:18288"
+).strip().rstrip("/")
+
+_MODEL_SERVER_PARSED = urlparse(MODEL_SERVER_BASE_URL)
+MODEL_SERVER_SCHEME = _MODEL_SERVER_PARSED.scheme or "http"
+MODEL_SERVER_HOST = _MODEL_SERVER_PARSED.hostname or "127.0.0.1"
+MODEL_SERVER_PORT = _MODEL_SERVER_PARSED.port or (443 if MODEL_SERVER_SCHEME == "https" else 80)
+MODEL_SERVER_URL = f"{MODEL_SERVER_SCHEME}://{MODEL_SERVER_HOST}"
+```
+
+**Example:**
+```bash
+PYWORKER_MODEL_SERVER_BASE_URL="http://127.0.0.1:18288"
+# Results in:
+# MODEL_SERVER_SCHEME="http"
+# MODEL_SERVER_HOST="127.0.0.1"
+# MODEL_SERVER_PORT=18288
+# MODEL_SERVER_URL="http://127.0.0.1"
+```
+
+## HandlerConfig
+
+Each handler defines a route endpoint with its behavior and optional benchmarking.
+
+### Bootstrap Ping Handler
+
+Lightweight benchmark used only for PyWorker startup compatibility:
+
+```python
+bootstrap_handler_config = HandlerConfig(
+    route="/benchmark/ping",
+    allow_parallel_requests=True,
+    max_queue_time=MAX_QUEUE_TIME,  # 0.0
+    benchmark_config=BenchmarkConfig(
+        generator=bootstrap_ping_generator,
+        runs=1,
+        concurrency=1,
+        do_warmup=False,
+    ),
+    remote_function=bootstrap_ping_remote,
+) if ENABLE_BOOTSTRAP_BENCHMARK else None
+```
+
+<ParamField path="route" type="string" required>
+  HTTP route path for this handler.
+  
+  Example: `/benchmark/ping`
+</ParamField>
+
+<ParamField path="allow_parallel_requests" type="bool" required>
+  Whether multiple requests can be processed simultaneously.
+  
+  - `True`: Multiple requests can run in parallel
+  - `False`: One request at a time (queue rejects new requests if max_queue_time=0)
+</ParamField>
+
+<ParamField path="max_queue_time" type="float" required>
+  Maximum time (in seconds) a request can wait in the queue before being rejected.
+  
+  - `0.0`: Reject immediately if a request is already running (enforces 1 worker = 1 generation)
+  - `>0`: Allow queueing for the specified duration
+</ParamField>
+
+<ParamField path="benchmark_config" type="BenchmarkConfig | None">
+  Configuration for benchmarking this route. Set to `None` to disable benchmarking.
+  
+  See [BenchmarkConfig](#benchmarkconfig) for details.
+</ParamField>
+
+<ParamField path="remote_function" type="callable">
+  Async function to handle requests when not proxying to model server.
+  
+  Used for internal routes like `/readyz` and `/benchmark/ping`.
+</ParamField>
+
+### Readiness Handler
+
+Healthcheck endpoint that verifies provisioning and model server status:
+
+```python
+HandlerConfig(
+    route=READY_ROUTE,  # "/readyz"
+    allow_parallel_requests=True,
+    max_queue_time=0.0,
+    benchmark_config=None,
+    remote_function=readyz_remote,
+)
+```
+
+The `readyz_remote` function:
+
+```python
+async def readyz_remote(**params):
+    # Check provisioning markers
+    if PROVISIONING_FAILED_MARKER.exists():
+        raise RuntimeError(f"Provisioning failed: {PROVISIONING_FAILED_MARKER}")
+    if not PROVISIONING_DONE_MARKER.exists():
+        raise RuntimeError(f"Provisioning not complete: {PROVISIONING_DONE_MARKER}")
+    
+    # Check model server health
+    health_url = f"{MODEL_HEALTHCHECK_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
+    async with aiohttp.ClientSession(timeout=10) as session:
+        async with session.get(health_url) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Model healthcheck failed status={response.status} url={health_url}"
+                )
+    
+    return {"ok": True, "healthcheck_url": health_url}
+```
+
+### Generation Handler
+
+Main endpoint for ComfyUI workflow generation:
+
+```python
+HandlerConfig(
+    route="/generate/sync",
+    allow_parallel_requests=False,  # One generation at a time
+    max_queue_time=MAX_QUEUE_TIME,  # 0.0 - reject queued requests
+    request_parser=ensure_required_loras,
+    workload_calculator=workload_calculator,
+    benchmark_config=None,
+)
+```
+
+<ParamField path="request_parser" type="callable">
+  Function to preprocess requests before sending to the model server.
+  
+  Used to download required LoRAs and verify manifests.
+</ParamField>
+
+<ParamField path="workload_calculator" type="callable">
+  Function that estimates request workload for cost calculation.
+  
+  See [Workload Calculation](#workload-calculation) for details.
+</ParamField>
+
+## BenchmarkConfig
+
+Configures benchmarking behavior for a route.
+
+```python
+BenchmarkConfig(
+    generator=bootstrap_ping_generator,
+    runs=1,
+    concurrency=1,
+    do_warmup=False,
+)
+```
+
+<ParamField path="generator" type="callable" required>
+  Function that generates synthetic payloads for benchmarking.
+  
+  ```python
+  def bootstrap_ping_generator() -> dict[str, Any]:
+      return {"ping": True, "ts": time.time()}
+  ```
+</ParamField>
+
+<ParamField path="runs" type="int" required>
+  Number of benchmark iterations to run.
+</ParamField>
+
+<ParamField path="concurrency" type="int" required>
+  Number of concurrent requests during benchmarking.
+</ParamField>
+
+<ParamField path="do_warmup" type="bool" required>
+  Whether to run a warmup iteration before benchmarking.
+</ParamField>
+
+<Note>
+  Heavy workflow benchmarking is **disabled** in this fork. The bootstrap ping benchmark is a lightweight compatibility measure for PyWorker startup.
+</Note>
+
+## LogActionConfig
+
+Defines log patterns that trigger actions in PyWorker.
+
+```python
+log_action_config=LogActionConfig(
+    on_load=MODEL_LOAD_LOG_MSG,
+    on_error=MODEL_ERROR_LOG_MSGS,
+    on_info=MODEL_INFO_LOG_MSGS
+)
+```
+
+<ParamField path="on_load" type="list[str]" required>
+  Log patterns indicating the model has finished loading and is ready.
+  
+  ```python
+  MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
+  ```
+  
+  When this pattern appears in `model_log_file`, PyWorker considers the model server ready.
+</ParamField>
+
+<ParamField path="on_error" type="list[str]" required>
+  Log patterns indicating errors that should trigger failure handling.
+  
+  ```python
+  MODEL_ERROR_LOG_MSGS = [
+      "MetadataIncompleteBuffer",
+      "[ERROR] Provisioning Script failed",
+  ]
+  ```
+</ParamField>
+
+<ParamField path="on_info" type="list[str]" required>
+  Log patterns for informational messages to surface to users.
+  
+  ```python
+  MODEL_INFO_LOG_MSGS = ['"message":"Downloading']
+  ```
+</ParamField>
+
+## Workload Calculation
+
+PyWorker estimates workload for cost calculation and routing decisions.
+
+### Workload Formula
+
+```python
+def estimate_workload(workflow):
+    # Extract dimensions
+    width = width or DEFAULT_WIDTH    # 432
+    height = height or DEFAULT_HEIGHT  # 768
+    frames = frames or DEFAULT_FRAMES  # 17
+    steps = steps or DEFAULT_STEPS     # 8
+    
+    # Calculate base workload
+    grid_w = math.ceil(width / 512)
+    grid_h = math.ceil(height / 512)
+    base_workload = grid_w * grid_h * frames * steps
+    
+    # Apply modifiers
+    if has_rife:
+        base_workload *= 1.35
+    if has_upscale:
+        base_workload *= 1.25
+    if video_combine_count > 1:
+        base_workload *= 1 + (video_combine_count - 1) * 0.15
+    
+    # Apply global multiplier
+    multiplier = WORKLOAD_MULTIPLIER  # 0.6
+    return max(1.0, base_workload * multiplier)
+```
+
+### Parameters
+
+<ParamField path="width" type="int" default="432">
+  Image/video width in pixels. Extracted from `WanImageToVideo` node or defaults.
+</ParamField>
+
+<ParamField path="height" type="int" default="768">
+  Image/video height in pixels. Extracted from `WanImageToVideo` node or defaults.
+</ParamField>
+
+<ParamField path="frames" type="int" default="17">
+  Number of video frames. Extracted from `WanImageToVideo.length` or defaults.
+</ParamField>
+
+<ParamField path="steps" type="int" default="8">
+  Number of denoising steps. Extracted from `KSamplerAdvanced.end_at_step` or `steps`.
+</ParamField>
+
+### Modifiers
+
+<ParamField path="has_rife" type="bool">
+  Whether workflow includes RIFE frame interpolation.
+  
+  **Multiplier:** 1.35x (35% increase)
+</ParamField>
+
+<ParamField path="has_upscale" type="bool">
+  Whether workflow includes upscaling nodes.
+  
+  **Multiplier:** 1.25x (25% increase)
+</ParamField>
+
+<ParamField path="video_combine_count" type="int">
+  Number of video combine operations in the workflow.
+  
+  **Multiplier:** 1 + (count - 1) × 0.15
+  
+  Examples:
+  - 2 combines: 1.15x
+  - 3 combines: 1.30x
+</ParamField>
+
+<ParamField path="WORKLOAD_MULTIPLIER" type="float" default="0.6">
+  Global multiplier applied to all workload calculations.
+  
+  Set in `worker.py`:
+  ```python
+  WORKLOAD_MULTIPLIER = 0.6
+  ```
+</ParamField>
+
+### Example Calculation
+
+**Simple 432×768 video, 17 frames, 8 steps:**
+
+```python
+grid_w = math.ceil(432 / 512) = 1
+grid_h = math.ceil(768 / 512) = 2
+base = 1 × 2 × 17 × 8 = 272
+workload = 272 × 0.6 = 163.2
+```
+
+**With RIFE interpolation:**
+
+```python
+base = 272 × 1.35 = 367.2
+workload = 367.2 × 0.6 = 220.32
+```
+
+**With RIFE + upscale + 2 combines:**
+
+```python
+base = 272 × 1.35 × 1.25 × 1.15 = 528.3
+workload = 528.3 × 0.6 = 316.98
+```
+
+### Workflow Parsing
+
+PyWorker extracts parameters from the workflow JSON:
+
+```python
+def extract_workflow(payload):
+    # Check multiple locations for workflow_json
+    if isinstance(payload.get("workflow_json"), dict):
+        return payload.get("workflow_json")
+    
+    input_data = payload.get("input")
+    if isinstance(input_data, dict) and isinstance(input_data.get("workflow_json"), dict):
+        return input_data.get("workflow_json")
+    
+    # Check nested payload/data fields
+    nested = payload.get("payload") or payload.get("data")
+    if isinstance(nested, dict):
+        return extract_workflow(nested)
+    
+    return None
+```
+
+### Node Resolution
+
+For dynamic values, PyWorker follows node references:
+
+```python
+def resolve_numeric_input(input_value, workflow, visited, depth=0):
+    # Direct numeric value
+    if isinstance(input_value, (int, float)):
+        return float(input_value)
+    
+    # Node reference: ["node_id", output_index]
+    if isinstance(input_value, list):
+        node_id = str(input_value[0])
+        node = workflow.get(node_id)
+        inputs = node.get("inputs") or {}
+        
+        # Try direct value
+        value = parse_numeric_value(inputs.get("value"))
+        if value is not None:
+            return value
+        
+        # Try math operations
+        a = resolve_numeric_input(inputs.get("a"), workflow, visited, depth + 1)
+        b = resolve_numeric_input(inputs.get("b"), workflow, visited, depth + 1)
+        operation = inputs.get("operation")
+        
+        if a and b and operation == "multiply":
+            return a * b
+```
+
+**Example workflow node:**
+```json
+{
+  "3": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "width": ["5", 0],    // Reference to node 5's output
+      "height": 768,         // Direct value
+      "length": 17
+    }
+  },
+  "5": {
+    "class_type": "MathNode",
+    "inputs": {
+      "operation": "multiply",
+      "a": 512,
+      "b": 2
+    }
+  }
+}
+```
+
+Resolved: `width = 512 × 2 = 1024`
+
+## Performance Tuning
+
+### Queue Rejection Strategy
+
+```python
+MAX_QUEUE_TIME = 0.0
+allow_parallel_requests = False
+```
+
+This enforces **1 worker = 1 generation**:
+- If a request is already running, new requests are immediately rejected with HTTP 503
+- Callers can re-route to another available worker
+- Prevents memory exhaustion from queued workflows
+- Provides predictable performance (no queue delays)
+
+### Workload Multiplier Tuning
+
+```python
+WORKLOAD_MULTIPLIER = 0.6
+```
+
+Adjust based on your hardware:
+- **Faster GPUs (A100, H100):** Decrease to 0.4-0.5 (routes more work to each instance)
+- **Slower GPUs (RTX 3090, 4090):** Increase to 0.7-0.8 (routes less work per instance)
+- **Testing:** Generate sample workflows and compare estimated vs. actual execution time
+
+### Bootstrap Benchmark
+
+```python
+ENABLE_BOOTSTRAP_BENCHMARK = os.getenv(
+    "PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK", 
+    "true"
+).lower() in {"1", "true", "yes", "on"}
+```
+
+Disable for slightly faster startup:
+
+```bash
+PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK=false
+```
+
+<Warning>
+  Only disable if you're not using Vast.ai's autoscaling or startup benchmarking features.
+</Warning>
+
+## Health Checks
+
+PyWorker provides two healthcheck mechanisms:
+
+### 1. Model Server Health
+
+**Endpoint:** `MODEL_HEALTHCHECK_BASE_URL + MODEL_HEALTHCHECK_ENDPOINT`
+
+**Default:** `http://127.0.0.1:18288/health`
+
+**What it checks:**
+- ComfyUI API wrapper is responding
+- HTTP 200 status from healthcheck endpoint
+
+### 2. Worker Readiness
+
+**Endpoint:** `PYWORKER_READY_ROUTE`
+
+**Default:** `/readyz`
+
+**What it checks:**
+- Provisioning completed successfully (`PROVISIONING_DONE_MARKER` exists)
+- Provisioning did not fail (`PROVISIONING_FAILED_MARKER` does not exist)
+- Model server healthcheck passes
+
+**Response:**
+```json
+{
+  "ok": true,
+  "healthcheck_url": "http://127.0.0.1:18288/health",
+  "model_server_base_url": "http://127.0.0.1:18288",
+  "params": {}
+}
+```
+
+## Complete Configuration Example
+
+```python
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
+
+# Environment variables
+MODEL_SERVER_BASE_URL = "http://127.0.0.1:18288"
+MODEL_HEALTHCHECK_ENDPOINT = "/health"
+READY_ROUTE = "/readyz"
+MAX_QUEUE_TIME = 0.0
+WORKLOAD_MULTIPLIER = 0.6
+
+# Worker configuration
+worker_config = WorkerConfig(
+    model_server_url="http://127.0.0.1",
+    model_server_port=18288,
+    model_log_file="/var/log/portal/comfyui.log",
+    model_healthcheck_url="/health",
+    handlers=[
+        # Bootstrap ping benchmark (optional)
+        HandlerConfig(
+            route="/benchmark/ping",
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=BenchmarkConfig(
+                generator=lambda: {"ping": True},
+                runs=1,
+                concurrency=1,
+                do_warmup=False,
+            ),
+            remote_function=lambda **p: {"ok": True},
+        ),
+        # Readiness check
+        HandlerConfig(
+            route="/readyz",
+            allow_parallel_requests=True,
+            max_queue_time=0.0,
+            benchmark_config=None,
+            remote_function=readyz_remote,
+        ),
+        # Main generation endpoint
+        HandlerConfig(
+            route="/generate/sync",
+            allow_parallel_requests=False,
+            max_queue_time=0.0,
+            request_parser=ensure_required_loras,
+            workload_calculator=workload_calculator,
+            benchmark_config=None,
+        ),
+    ],
+    log_action_config=LogActionConfig(
+        on_load=["To see the GUI go to: "],
+        on_error=["MetadataIncompleteBuffer", "[ERROR] Provisioning Script failed"],
+        on_info=['"message":"Downloading']
+    )
+)
+
+Worker(worker_config).run()
+```

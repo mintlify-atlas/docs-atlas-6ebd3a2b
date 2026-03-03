@@ -1,0 +1,442 @@
+---
+title: 'POST /generate/sync'
+description: 'Generate images or videos using ComfyUI workflows synchronously'
+---
+
+## Endpoint
+
+```
+POST /generate/sync
+```
+
+Processes ComfyUI workflows synchronously and returns results when generation is complete. Supports both predefined modifiers (like Text2Image) and custom workflow JSON.
+
+## Authentication
+
+Requires a valid Vast.ai API key set in the `VAST_API_KEY` environment variable when using the Serverless SDK.
+
+## Request Configuration
+
+- **Parallel Requests**: Not allowed (one generation per worker at a time)
+- **Queue Time**: 0 seconds (requests are rejected if worker is busy)
+- **Workload**: Automatically calculated based on workflow complexity (dimensions, frames, steps)
+
+## Request Body
+
+Choose either **Modifier Mode** (predefined workflows) or **Custom Workflow Mode** (raw ComfyUI JSON).
+
+### Modifier Mode
+
+<ParamField body="input" type="object" required>
+  Main workflow data container
+
+  <ParamField body="request_id" type="string">
+    Unique identifier for the request. Auto-generated UUID if not provided.
+  </ParamField>
+
+  <ParamField body="modifier" type="string" required>
+    Name of the predefined workflow modifier (e.g., "Text2Image", "RawWorkflow")
+  </ParamField>
+
+  <ParamField body="modifications" type="object" required>
+    Parameters to pass to the modifier
+
+    <ParamField body="prompt" type="string">
+      Text prompt for image generation
+    </ParamField>
+
+    <ParamField body="width" type="integer" default="512">
+      Image width in pixels
+    </ParamField>
+
+    <ParamField body="height" type="integer" default="512">
+      Image height in pixels
+    </ParamField>
+
+    <ParamField body="steps" type="integer" default="20">
+      Number of denoising steps
+    </ParamField>
+
+    <ParamField body="seed" type="integer">
+      Random seed for reproducibility. Random if not provided.
+    </ParamField>
+  </ParamField>
+
+  <ParamField body="required_loras" type="array">
+    List of LoRA model filenames to download (e.g., `["model.safetensors"]`)
+  </ParamField>
+
+  <ParamField body="lora_manifest" type="object">
+    Signed manifest for LoRA verification (required when `PYWORKER_MANIFEST_SECRET` is set)
+
+    <ParamField body="requiredLoras" type="array" required>
+      Array of LoRA filenames approved for this request
+    </ParamField>
+
+    <ParamField body="generationId" type="string" required>
+      Unique generation identifier
+    </ParamField>
+
+    <ParamField body="endpoint" type="string" required>
+      Endpoint identifier (must match `PYWORKER_MANIFEST_ENDPOINT`)
+    </ParamField>
+
+    <ParamField body="issuedAt" type="number" required>
+      Unix timestamp in milliseconds when manifest was issued
+    </ParamField>
+
+    <ParamField body="signature" type="string" required>
+      HMAC-SHA256 signature of the manifest payload
+    </ParamField>
+  </ParamField>
+
+  <ParamField body="s3" type="object">
+    S3 configuration for file storage (overrides environment variables)
+
+    <ParamField body="access_key_id" type="string">
+      S3 access key ID
+    </ParamField>
+
+    <ParamField body="secret_access_key" type="string">
+      S3 secret access key
+    </ParamField>
+
+    <ParamField body="endpoint_url" type="string">
+      S3-compatible endpoint URL
+    </ParamField>
+
+    <ParamField body="bucket_name" type="string">
+      S3 bucket name
+    </ParamField>
+
+    <ParamField body="region" type="string">
+      S3 region
+    </ParamField>
+  </ParamField>
+
+  <ParamField body="webhook" type="object">
+    Webhook configuration for notifications
+
+    <ParamField body="url" type="string">
+      Webhook URL to send notifications
+    </ParamField>
+
+    <ParamField body="extra_params" type="object">
+      Additional custom fields to include in webhook payload
+    </ParamField>
+  </ParamField>
+</ParamField>
+
+### Custom Workflow Mode
+
+<ParamField body="input" type="object" required>
+  Main workflow data container
+
+  <ParamField body="request_id" type="string">
+    Unique identifier for the request. Auto-generated UUID if not provided.
+  </ParamField>
+
+  <ParamField body="workflow_json" type="object" required>
+    Complete ComfyUI workflow JSON object. Each key is a node ID, each value contains node configuration including `class_type` and `inputs`.
+  </ParamField>
+
+  <ParamField body="required_loras" type="array">
+    List of LoRA model filenames to download
+  </ParamField>
+
+  <ParamField body="lora_manifest" type="object">
+    Signed manifest for LoRA verification (see Modifier Mode for schema)
+  </ParamField>
+
+  <ParamField body="s3" type="object">
+    S3 configuration (see Modifier Mode for schema)
+  </ParamField>
+
+  <ParamField body="webhook" type="object">
+    Webhook configuration (see Modifier Mode for schema)
+  </ParamField>
+</ParamField>
+
+## Response
+
+<ResponseField name="url" type="string">
+  Worker URL where the generation was processed
+</ResponseField>
+
+<ResponseField name="response" type="object">
+  ComfyUI generation response
+
+  <ResponseField name="comfyui_response" type="object">
+    Raw ComfyUI API response containing output nodes
+
+    Each node ID contains:
+    <ResponseField name="outputs" type="object">
+      Node outputs, typically containing generated images/videos
+
+      <ResponseField name="images" type="array">
+        Array of generated image metadata
+
+        <ResponseField name="filename" type="string">
+          Generated file name (can be fetched via `/view` endpoint)
+        </ResponseField>
+
+        <ResponseField name="subfolder" type="string">
+          Subfolder path if applicable
+        </ResponseField>
+
+        <ResponseField name="type" type="string">
+          Output type (e.g., "output")
+        </ResponseField>
+      </ResponseField>
+    </ResponseField>
+  </ResponseField>
+</ResponseField>
+
+<ResponseField name="ok" type="boolean">
+  Indicates if the request was successful
+</ResponseField>
+
+## Examples
+
+### Text-to-Image with SDK
+
+```python
+import uuid
+from vastai import Serverless
+
+async with Serverless() as client:
+    endpoint = await client.get_endpoint(name="my-comfyui-endpoint")
+    
+    payload = {
+        "input": {
+            "request_id": str(uuid.uuid4()),
+            "modifier": "Text2Image",
+            "modifications": {
+                "prompt": "a beautiful sunset over mountains, digital art",
+                "width": 1024,
+                "height": 1024,
+                "steps": 30,
+                "seed": 42
+            }
+        }
+    }
+    
+    response = await endpoint.request("/generate/sync", payload, cost=100)
+    print(f"Worker URL: {response['url']}")
+```
+
+### Custom Workflow with SDK
+
+```python
+import uuid
+import json
+from vastai import Serverless
+
+with open("my_workflow.json", "r") as f:
+    workflow_json = json.load(f)
+
+async with Serverless() as client:
+    endpoint = await client.get_endpoint(name="my-comfyui-endpoint")
+    
+    payload = {
+        "input": {
+            "request_id": str(uuid.uuid4()),
+            "workflow_json": workflow_json
+        }
+    }
+    
+    response = await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+### cURL Example
+
+```bash
+curl -X POST "https://your-worker-url/generate/sync" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": {
+      "modifier": "Text2Image",
+      "modifications": {
+        "prompt": "a cat sitting on a windowsill",
+        "width": 512,
+        "height": 512,
+        "steps": 20,
+        "seed": 42
+      }
+    }
+  }'
+```
+
+### Fetching Generated Images
+
+```python
+import aiohttp
+
+async def fetch_image(worker_url: str, filename: str):
+    url = f"{worker_url}/view"
+    params = {"filename": filename, "type": "output"}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status == 200:
+                image_data = await resp.read()
+                with open(f"output_{filename}", "wb") as f:
+                    f.write(image_data)
+                print(f"Saved: output_{filename}")
+
+# Extract filename from response
+filename = response["response"]["comfyui_response"]["node_id"]["outputs"]["images"][0]["filename"]
+await fetch_image(response["url"], filename)
+```
+
+## Error Codes
+
+### 400 Bad Request
+
+**Invalid payload structure**
+```json
+{
+  "error": "Payload must be an object."
+}
+```
+
+**Missing workflow_json in custom mode**
+```json
+{
+  "error": "payload.input must be an object."
+}
+```
+
+**Invalid LoRA filename**
+```json
+{
+  "error": "Invalid LoRA filename 'invalid-file.txt'."
+}
+```
+
+**LoRA manifest validation failed**
+```json
+{
+  "error": "lora_manifest.signature is required when PYWORKER_MANIFEST_SECRET is set."
+}
+```
+
+**Manifest signature mismatch**
+```json
+{
+  "error": "lora_manifest signature mismatch."
+}
+```
+
+**Manifest expired**
+```json
+{
+  "error": "lora_manifest signature expired."
+}
+```
+
+**Unauthorized LoRA usage**
+```json
+{
+  "error": "Workflow requested LoRAs not allowed by signed manifest: model1.safetensors, model2.safetensors"
+}
+```
+
+### 503 Service Unavailable
+
+**Worker busy (queue time = 0)**
+```json
+{
+  "error": "Worker is currently processing another request. Please try another worker or retry later."
+}
+```
+
+### 500 Internal Server Error
+
+**LoRA download failed**
+```json
+{
+  "error": "HF_TOKEN is required to download LoRAs."
+}
+```
+
+**ComfyUI processing error**
+```json
+{
+  "error": "ComfyUI workflow execution failed."
+}
+```
+
+## LoRA Model Management
+
+The worker automatically downloads required LoRA models from HuggingFace before processing workflows.
+
+### Automatic Detection
+
+LoRAs are detected from workflow nodes with inputs matching `lora_name`, `lora_1_name`, `lora_2_name`, etc.
+
+### Manual Specification
+
+```json
+{
+  "input": {
+    "workflow_json": { ... },
+    "required_loras": ["style-lora.safetensors", "face-lora.safetensors"]
+  }
+}
+```
+
+### Signed Manifests
+
+When `PYWORKER_MANIFEST_SECRET` is configured, requests must include a signed `lora_manifest`:
+
+```json
+{
+  "input": {
+    "workflow_json": { ... },
+    "lora_manifest": {
+      "requiredLoras": ["approved-model.safetensors"],
+      "generationId": "gen-12345",
+      "endpoint": "direct-instance",
+      "issuedAt": 1709481600000,
+      "signature": "a1b2c3d4e5f6..."
+    }
+  }
+}
+```
+
+The signature is computed as:
+```python
+import hmac, hashlib, json
+
+payload = {
+    "endpoint": endpoint,
+    "generationId": generation_id,
+    "issuedAt": int(issued_at),
+    "requiredLoras": sorted(loras)
+}
+
+signature = hmac.new(
+    secret.encode("utf-8"),
+    json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+    hashlib.sha256
+).hexdigest()
+```
+
+## Workload Calculation
+
+The endpoint automatically calculates request cost based on:
+
+- **Dimensions**: Width and height (512px grid units)
+- **Frames**: Video length for image-to-video workflows (default: 17)
+- **Steps**: Denoising steps (default: 8)
+- **Modifiers**: RIFE interpolation (×1.35), upscaling (×1.25), video combines (×1.15 per extra)
+
+Base formula:
+```python
+grid_w = ceil(width / 512)
+grid_h = ceil(height / 512)
+workload = grid_w × grid_h × frames × steps × modifiers × 0.6
+```
+
+This ensures fair resource allocation across worker instances.

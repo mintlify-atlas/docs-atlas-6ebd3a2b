@@ -1,0 +1,282 @@
+---
+title: 'GET /readyz'
+description: 'Health check endpoint for worker readiness'
+---
+
+## Endpoint
+
+```
+GET /readyz
+```
+
+Health check endpoint that verifies the worker is fully provisioned and ready to process generation requests.
+
+## Authentication
+
+No authentication required. This is a public health check endpoint.
+
+## Request Configuration
+
+- **Parallel Requests**: Allowed (health checks can run concurrently)
+- **Queue Time**: 0 seconds (immediate response)
+- **Benchmark**: Disabled (no workload calculation)
+
+## Query Parameters
+
+This endpoint accepts any query parameters, which will be echoed back in the response for debugging purposes.
+
+## Response
+
+<ResponseField name="ok" type="boolean">
+  Always `true` when the worker is healthy
+</ResponseField>
+
+<ResponseField name="healthcheck_url" type="string">
+  The full URL used to check the model server health (e.g., `http://127.0.0.1:18288/health`)
+</ResponseField>
+
+<ResponseField name="model_server_base_url" type="string">
+  The base URL of the ComfyUI model server
+</ResponseField>
+
+<ResponseField name="params" type="object">
+  Echo of any query parameters sent with the request (for debugging)
+</ResponseField>
+
+## Health Checks Performed
+
+The `/readyz` endpoint performs the following checks:
+
+### 1. Provisioning Status
+
+Checks for provisioning marker files:
+
+- **Success Marker**: `/workspace/.provisioning-complete` (or `PROVISIONING_DONE_MARKER` env var)
+- **Failure Marker**: `/workspace/.provisioning-failed` (or `PROVISIONING_FAILED_MARKER` env var)
+
+If the failure marker exists or the success marker is missing, the health check fails.
+
+### 2. Model Server Health
+
+Makes an HTTP request to the ComfyUI model server's health endpoint:
+
+- **Default URL**: `http://127.0.0.1:18288/health` (configurable via `PYWORKER_MODEL_HEALTHCHECK_BASE_URL` and `PYWORKER_MODEL_HEALTHCHECK_ENDPOINT`)
+- **Timeout**: 10 seconds
+- **Expected Status**: 200 OK
+
+If the model server returns a non-200 status, the health check fails.
+
+## Examples
+
+### Basic Health Check
+
+```bash
+curl https://your-worker-url/readyz
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "healthcheck_url": "http://127.0.0.1:18288/health",
+  "model_server_base_url": "http://127.0.0.1:18288",
+  "params": {}
+}
+```
+
+### Health Check with Debug Parameters
+
+```bash
+curl "https://your-worker-url/readyz?source=monitoring&timestamp=1709481600"
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "healthcheck_url": "http://127.0.0.1:18288/health",
+  "model_server_base_url": "http://127.0.0.1:18288",
+  "params": {
+    "source": "monitoring",
+    "timestamp": "1709481600"
+  }
+}
+```
+
+### Python SDK Usage
+
+```python
+import aiohttp
+
+async def check_worker_health(worker_url: str) -> bool:
+    """Check if a worker is ready to process requests"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{worker_url}/readyz", timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("ok", False)
+                return False
+    except Exception as e:
+        print(f"Health check failed: {e}")
+        return False
+
+# Usage
+if await check_worker_health("https://worker-123.vast.ai"):
+    print("Worker is ready!")
+else:
+    print("Worker is not ready")
+```
+
+### Polling for Readiness
+
+```python
+import asyncio
+import aiohttp
+
+async def wait_for_worker_ready(worker_url: str, timeout: int = 300) -> bool:
+    """Poll worker until ready or timeout"""
+    start_time = asyncio.get_event_loop().time()
+    
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{worker_url}/readyz", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            print("Worker is ready!")
+                            return True
+        except Exception as e:
+            print(f"Health check attempt failed: {e}")
+        
+        # Check timeout
+        if asyncio.get_event_loop().time() - start_time > timeout:
+            print("Timeout waiting for worker")
+            return False
+        
+        # Wait before retrying
+        await asyncio.sleep(5)
+
+# Usage
+await wait_for_worker_ready("https://worker-123.vast.ai", timeout=300)
+```
+
+## Error Responses
+
+### Provisioning Not Complete
+
+**Status**: 500 Internal Server Error
+
+```json
+{
+  "error": "Provisioning not complete: /workspace/.provisioning-complete"
+}
+```
+
+This error occurs when the worker is still initializing and the provisioning script has not finished.
+
+### Provisioning Failed
+
+**Status**: 500 Internal Server Error
+
+```json
+{
+  "error": "Provisioning failed: /workspace/.provisioning-failed"
+}
+```
+
+This error indicates that the provisioning script encountered a fatal error during setup.
+
+### Model Server Unhealthy
+
+**Status**: 500 Internal Server Error
+
+```json
+{
+  "error": "Model healthcheck failed status=503 url=http://127.0.0.1:18288/health body=Service Unavailable"
+}
+```
+
+This error means the ComfyUI model server is not responding with a healthy status. Common causes:
+
+- ComfyUI is still loading models
+- ComfyUI crashed or failed to start
+- Network connectivity issues between PyWorker and ComfyUI
+- Model loading errors (missing checkpoints, OOM, etc.)
+
+## Environment Variables
+
+The health check behavior can be configured with the following environment variables:
+
+<ParamField path="PYWORKER_READY_ROUTE" type="string" default="/readyz">
+  Custom route path for the health check endpoint
+</ParamField>
+
+<ParamField path="PYWORKER_MODEL_HEALTHCHECK_BASE_URL" type="string" default="http://127.0.0.1:18288">
+  Base URL of the model server to check
+</ParamField>
+
+<ParamField path="PYWORKER_MODEL_HEALTHCHECK_ENDPOINT" type="string" default="/health">
+  Health check endpoint path on the model server
+</ParamField>
+
+<ParamField path="PROVISIONING_DONE_MARKER" type="string" default="/workspace/.provisioning-complete">
+  Path to the file that indicates provisioning completed successfully
+</ParamField>
+
+<ParamField path="PROVISIONING_FAILED_MARKER" type="string" default="/workspace/.provisioning-failed">
+  Path to the file that indicates provisioning failed
+</ParamField>
+
+## Use Cases
+
+### Load Balancer Health Checks
+
+Configure your load balancer or autoscaler to use `/readyz` for health checks:
+
+```yaml
+# Example: Kubernetes liveness probe
+livenessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 3
+```
+
+### Pre-flight Checks
+
+Verify worker readiness before sending expensive generation requests:
+
+```python
+async def generate_with_health_check(endpoint, payload):
+    # Check health first
+    if not await check_worker_health(endpoint.url):
+        raise Exception("Worker not ready")
+    
+    # Proceed with generation
+    return await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+### Monitoring and Alerting
+
+Integrate with monitoring systems to track worker availability:
+
+```python
+import prometheus_client
+
+worker_health = prometheus_client.Gauge(
+    'worker_health_status',
+    'Worker health status (1=healthy, 0=unhealthy)',
+    ['worker_id']
+)
+
+async def monitor_worker(worker_id: str, worker_url: str):
+    while True:
+        healthy = await check_worker_health(worker_url)
+        worker_health.labels(worker_id=worker_id).set(1 if healthy else 0)
+        await asyncio.sleep(30)
+```

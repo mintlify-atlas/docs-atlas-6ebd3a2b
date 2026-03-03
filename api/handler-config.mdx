@@ -1,0 +1,330 @@
+---
+title: 'HandlerConfig'
+description: 'Configuration for individual PyWorker request handlers'
+---
+
+The `HandlerConfig` object defines a single API route handler, including its path, concurrency behavior, request processing, and optional benchmarking configuration.
+
+## Usage
+
+```python
+from vastai import HandlerConfig
+
+handler = HandlerConfig(
+    route="/generate/sync",
+    allow_parallel_requests=False,
+    max_queue_time=0.0,
+    request_parser=ensure_required_loras,
+    workload_calculator=workload_calculator,
+    benchmark_config=None
+)
+```
+
+## Configuration Fields
+
+<ParamField path="route" type="str" required>
+  The API endpoint path for this handler.
+  
+  Example: `"/generate/sync"`, `"/readyz"`, `"/benchmark/ping"`
+  
+  This route will be exposed by the PyWorker server and proxied to the model server or custom remote function.
+</ParamField>
+
+<ParamField path="allow_parallel_requests" type="bool">
+  Whether this handler can process multiple requests simultaneously.
+  
+  - `True`: Multiple requests can be processed in parallel
+  - `False`: Only one request at a time (enforces sequential processing)
+  
+  Default: `False`
+  
+  <Warning>
+    For GPU-intensive operations like image/video generation, set this to `False` to prevent resource contention and OOM errors.
+  </Warning>
+  
+  Example:
+  ```python
+  # Generation endpoint - no parallelism
+  HandlerConfig(
+      route="/generate/sync",
+      allow_parallel_requests=False,
+      ...
+  )
+  
+  # Health check - allow parallelism
+  HandlerConfig(
+      route="/readyz",
+      allow_parallel_requests=True,
+      ...
+  )
+  ```
+</ParamField>
+
+<ParamField path="max_queue_time" type="float">
+  Maximum time (in seconds) a request can wait in queue before being rejected.
+  
+  - `0.0`: Reject immediately if another request is already running (no queueing)
+  - `> 0.0`: Wait up to this many seconds for the current request to complete
+  
+  Default: `0.0`
+  
+  <Note>
+    Setting this to `0.0` ensures fast failure when a worker is busy, allowing load balancers to route requests to other available workers immediately.
+  </Note>
+  
+  Example:
+  ```python
+  HandlerConfig(
+      route="/generate/sync",
+      allow_parallel_requests=False,
+      max_queue_time=0.0,  # Reject immediately if busy
+      ...
+  )
+  ```
+</ParamField>
+
+<ParamField path="request_parser" type="callable">
+  Optional function to parse and transform the incoming request payload.
+  
+  **Signature:** `(payload: dict) -> dict`
+  
+  The parser receives the request payload and should return a modified payload. This is useful for:
+  - Validating request structure
+  - Downloading required assets (e.g., LoRA models)
+  - Enriching the payload with additional data
+  - Normalizing input formats
+  
+  Example:
+  ```python
+  def ensure_required_loras(payload: dict) -> dict:
+      # Extract LoRA names from workflow
+      workflow = payload.get("input", {}).get("workflow_json", {})
+      loras = extract_workflow_loras(workflow)
+      
+      # Download each LoRA if not present
+      for lora_name in loras:
+          ensure_lora_downloaded(lora_name)
+      
+      # Add to payload
+      payload["input"]["required_loras"] = loras
+      return payload
+  
+  HandlerConfig(
+      route="/generate/sync",
+      request_parser=ensure_required_loras,
+      ...
+  )
+  ```
+</ParamField>
+
+<ParamField path="workload_calculator" type="callable">
+  Optional function to estimate the computational cost of a request.
+  
+  **Signature:** `(payload: dict) -> float`
+  
+  Returns a numeric workload estimate used for:
+  - Request scheduling and prioritization
+  - Performance monitoring
+  - Cost estimation
+  - Capacity planning
+  
+  The workload value should be proportional to expected execution time or computational resources.
+  
+  Example:
+  ```python
+  def workload_calculator(payload: dict) -> float:
+      workflow = extract_workflow(payload)
+      
+      # Extract generation parameters
+      width = extract_width(workflow) or 432
+      height = extract_height(workflow) or 768
+      frames = extract_frames(workflow) or 17
+      steps = extract_steps(workflow) or 8
+      
+      # Calculate base workload
+      grid_w = math.ceil(width / 512)
+      grid_h = math.ceil(height / 512)
+      workload = grid_w * grid_h * frames * steps
+      
+      # Apply modifiers for expensive operations
+      if has_rife(workflow):
+          workload *= 1.35
+      if has_upscale(workflow):
+          workload *= 1.25
+      
+      return max(1.0, workload * 0.6)  # Apply multiplier
+  
+  HandlerConfig(
+      route="/generate/sync",
+      workload_calculator=workload_calculator,
+      ...
+  )
+  ```
+</ParamField>
+
+<ParamField path="benchmark_config" type="BenchmarkConfig | None">
+  Optional benchmarking configuration for this handler.
+  
+  When provided, PyWorker will run benchmark tests during startup to measure baseline performance.
+  
+  **BenchmarkConfig fields:**
+  - `generator` (callable): Function that generates synthetic test payloads
+  - `runs` (int): Number of benchmark iterations to run
+  - `concurrency` (int): Number of concurrent requests during benchmark
+  - `do_warmup` (bool): Whether to run warmup requests before measuring
+  
+  Example:
+  ```python
+  def bootstrap_ping_generator() -> dict:
+      return {"ping": True, "ts": time.time()}
+  
+  HandlerConfig(
+      route="/benchmark/ping",
+      benchmark_config=BenchmarkConfig(
+          generator=bootstrap_ping_generator,
+          runs=1,
+          concurrency=1,
+          do_warmup=False,
+      ),
+      ...
+  )
+  ```
+  
+  Set to `None` to disable benchmarking for this handler.
+</ParamField>
+
+<ParamField path="remote_function" type="callable">
+  Optional custom async function to handle requests instead of proxying to the model server.
+  
+  **Signature:** `async (**params) -> dict`
+  
+  When provided, this function is called directly instead of forwarding the request to the model server. Useful for:
+  - Custom health checks
+  - Lightweight endpoints
+  - Utility routes
+  - Integration endpoints
+  
+  Example:
+  ```python
+  async def readyz_remote(**params):
+      # Check provisioning markers
+      if PROVISIONING_FAILED_MARKER.exists():
+          raise RuntimeError("Provisioning failed")
+      if not PROVISIONING_DONE_MARKER.exists():
+          raise RuntimeError("Provisioning not complete")
+      
+      # Check model server health
+      async with aiohttp.ClientSession() as session:
+          async with session.get(f"{MODEL_SERVER_URL}/health") as resp:
+              if resp.status != 200:
+                  raise RuntimeError(f"Health check failed: {resp.status}")
+      
+      return {"ok": True, "params": params}
+  
+  HandlerConfig(
+      route="/readyz",
+      allow_parallel_requests=True,
+      remote_function=readyz_remote,
+      ...
+  )
+  ```
+  
+  If not provided, requests are proxied to the model server at the same route path.
+</ParamField>
+
+## Handler Types
+
+### Generation Handler
+
+For GPU-intensive model inference:
+
+```python
+HandlerConfig(
+    route="/generate/sync",
+    allow_parallel_requests=False,  # One at a time
+    max_queue_time=0.0,             # Fail fast if busy
+    request_parser=ensure_required_loras,
+    workload_calculator=workload_calculator,
+    benchmark_config=None,
+)
+```
+
+### Health Check Handler
+
+For readiness and liveness probes:
+
+```python
+HandlerConfig(
+    route="/readyz",
+    allow_parallel_requests=True,   # Allow concurrent checks
+    max_queue_time=0.0,
+    benchmark_config=None,
+    remote_function=readyz_remote,  # Custom implementation
+)
+```
+
+### Benchmark Handler
+
+For startup performance testing:
+
+```python
+HandlerConfig(
+    route="/benchmark/ping",
+    allow_parallel_requests=True,
+    max_queue_time=0.0,
+    benchmark_config=BenchmarkConfig(
+        generator=bootstrap_ping_generator,
+        runs=1,
+        concurrency=1,
+        do_warmup=False,
+    ),
+    remote_function=bootstrap_ping_remote,
+)
+```
+
+## Complete Example
+
+From `workers/comfyui-json/worker.py`:
+
+```python
+from vastai import HandlerConfig, BenchmarkConfig
+
+handlers = [
+    # Lightweight benchmark (optional)
+    HandlerConfig(
+        route="/benchmark/ping",
+        allow_parallel_requests=True,
+        max_queue_time=0.0,
+        benchmark_config=BenchmarkConfig(
+            generator=bootstrap_ping_generator,
+            runs=1,
+            concurrency=1,
+            do_warmup=False,
+        ),
+        remote_function=bootstrap_ping_remote,
+    ),
+    
+    # Readiness check
+    HandlerConfig(
+        route="/readyz",
+        allow_parallel_requests=True,
+        max_queue_time=0.0,
+        benchmark_config=None,
+        remote_function=readyz_remote,
+    ),
+    
+    # Main generation endpoint
+    HandlerConfig(
+        route="/generate/sync",
+        allow_parallel_requests=False,
+        max_queue_time=0.0,
+        request_parser=ensure_required_loras,
+        workload_calculator=workload_calculator,
+        benchmark_config=None,
+    ),
+]
+```
+
+## See Also
+
+- [WorkerConfig](/api/worker-config) - Main worker configuration

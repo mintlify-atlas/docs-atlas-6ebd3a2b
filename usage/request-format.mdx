@@ -1,0 +1,363 @@
+---
+title: Request Format
+description: Understanding the request and response structure for ComfyUI workers
+---
+
+## Request Structure
+
+All requests to the `/generate/sync` endpoint use this base structure:
+
+```json
+{
+  "input": {
+    "request_id": "uuid-string",  // Optional - auto-generated if not provided
+    // Mode-specific fields here
+    "s3": { ... },                 // Optional
+    "webhook": { ... }             // Optional
+  }
+}
+```
+
+### Required Fields
+
+- **`input`**: Contains the main workflow data
+- **`input.request_id`**: Unique identifier for the request (auto-generated if omitted)
+
+You must specify either **modifier mode** OR **custom workflow mode**, but not both.
+
+## Workflow Modes
+
+<Tabs>
+  <Tab title="Modifier Mode">
+    Use predefined workflow modifiers with simple parameters:
+
+    ```json
+    {
+      "input": {
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "modifier": "Text2Image",
+        "modifications": {
+          "prompt": "a cat sitting on a windowsill",
+          "width": 512,
+          "height": 512,
+          "steps": 20,
+          "seed": 42
+        }
+      }
+    }
+    ```
+
+    **Fields:**
+    - `modifier`: Name of the predefined workflow (e.g., "Text2Image", "RawWorkflow")
+    - `modifications`: Parameters for the modifier
+
+    **Common modifications:**
+    - `prompt`: Text description for image generation
+    - `width`: Image width in pixels
+    - `height`: Image height in pixels
+    - `steps`: Number of denoising steps
+    - `seed`: Random seed for reproducibility
+  </Tab>
+
+  <Tab title="Custom Workflow">
+    Submit a complete ComfyUI workflow JSON:
+
+    ```json
+    {
+      "input": {
+        "request_id": "550e8400-e29b-41d4-a716-446655440001",
+        "workflow_json": {
+          "3": {
+            "inputs": {
+              "seed": 42,
+              "steps": 20,
+              "cfg": 8,
+              "sampler_name": "euler",
+              "scheduler": "normal",
+              "denoise": 1,
+              "model": ["4", 0],
+              "positive": ["6", 0],
+              "negative": ["7", 0],
+              "latent_image": ["5", 0]
+            },
+            "class_type": "KSampler"
+          },
+          "4": {
+            "inputs": {
+              "ckpt_name": "sd_xl_base_1.0.safetensors"
+            },
+            "class_type": "CheckpointLoaderSimple"
+          }
+          // ... additional nodes
+        }
+      }
+    }
+    ```
+
+    **Fields:**
+    - `workflow_json`: Complete ComfyUI workflow with all nodes and connections
+
+    The workflow JSON follows ComfyUI's standard format with numbered nodes, inputs, and class types.
+  </Tab>
+</Tabs>
+
+## Optional Configuration
+
+### S3 Upload Configuration
+
+Configure S3-compatible storage for automatic image uploads.
+
+**Via Request JSON:**
+
+```json
+{
+  "input": {
+    "modifier": "Text2Image",
+    "modifications": { ... },
+    "s3": {
+      "access_key_id": "your-s3-access-key",
+      "secret_access_key": "your-s3-secret-access-key",
+      "endpoint_url": "https://my-endpoint.backblaze.com",
+      "bucket_name": "your-bucket",
+      "region": "us-east-1"
+    }
+  }
+}
+```
+
+**Via Environment Variables:**
+
+```bash
+S3_ACCESS_KEY_ID=your-key
+S3_SECRET_ACCESS_KEY=your-secret
+S3_BUCKET_NAME=your-bucket
+S3_ENDPOINT_URL=https://s3.amazonaws.com
+S3_REGION=us-east-1
+```
+
+Request-level configuration takes precedence over environment variables.
+
+### Webhook Configuration
+
+Receive notifications when generation completes.
+
+**Via Request JSON:**
+
+```json
+{
+  "input": {
+    "modifier": "Text2Image",
+    "modifications": { ... },
+    "webhook": {
+      "url": "https://your-webhook.com/notify",
+      "extra_params": {
+        "user_id": "12345",
+        "custom_field": "value"
+      }
+    }
+  }
+}
+```
+
+**Via Environment Variables:**
+
+```bash
+WEBHOOK_URL=https://your-webhook.com
+WEBHOOK_TIMEOUT=30  # Timeout in seconds
+```
+
+## Response Format
+
+### Successful Response
+
+```json
+{
+  "url": "https://worker-instance.vast.ai",
+  "response": {
+    "comfyui_response": {
+      "9": {
+        "outputs": {
+          "images": [
+            {
+              "filename": "ComfyUI_00001_.png",
+              "subfolder": "",
+              "type": "output"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+**Key fields:**
+- `url`: Worker instance URL for downloading images
+- `response.comfyui_response`: Raw ComfyUI output
+- `outputs.images[].filename`: Generated image filename
+
+### Extracting Image Information
+
+From `client.py:111-119`:
+
+```python
+def extract_filename(response: dict) -> str | None:
+    """Extract the generated image filename from ComfyUI response"""
+    if "comfyui_response" in response:
+        for data in response["comfyui_response"].values():
+            if isinstance(data, dict) and "outputs" in data:
+                for node_output in data["outputs"].values():
+                    if "images" in node_output and node_output["images"]:
+                        return node_output["images"][0].get("filename")
+    return None
+```
+
+### Downloading Images
+
+Use the worker's `/view` endpoint to fetch generated images:
+
+```http
+GET {worker_url}/view?filename={filename}&type=output
+```
+
+Example:
+```
+https://worker-instance.vast.ai/view?filename=ComfyUI_00001_.png&type=output
+```
+
+From `client.py:145-171`:
+
+```python
+async def download_image(worker_url: str, filename: str, local_name: str):
+    url = f"{worker_url}/view"
+    params = {"filename": filename, "type": "output"}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, ssl=False) as resp:
+            if resp.status == 200:
+                path = f"generated_images/{local_name}"
+                image_data = await resp.read()
+                with open(path, "wb") as f:
+                    f.write(image_data)
+                return path
+    return None
+```
+
+## Complete Examples
+
+### Text-to-Image Request
+
+From `client.py:55-80`:
+
+```python
+import uuid
+
+# Prepare request
+payload = {
+    "input": {
+        "request_id": str(uuid.uuid4()),
+        "modifier": "Text2Image",
+        "modifications": {
+            "prompt": "a beautiful sunset over mountains, digital art",
+            "width": 1024,
+            "height": 768,
+            "steps": 30,
+            "seed": 123456789,
+        },
+    }
+}
+
+# Send to endpoint
+response = await endpoint.request("/generate/sync", payload, cost=100)
+
+# Process response
+worker_url = response.get("url", "")
+if "response" in response:
+    filename = extract_filename(response["response"])
+    if filename:
+        await download_image(worker_url, filename, "output.png")
+```
+
+### Custom Workflow Request
+
+From `client.py:83-97`:
+
+```python
+import json
+import uuid
+
+# Load workflow from file
+with open("my_workflow.json", "r") as f:
+    workflow_json = json.load(f)
+
+# Prepare request
+payload = {
+    "input": {
+        "request_id": str(uuid.uuid4()),
+        "workflow_json": workflow_json,
+    }
+}
+
+# Send to endpoint
+response = await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+### Request with S3 and Webhook
+
+```json
+{
+  "input": {
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "modifier": "Text2Image",
+    "modifications": {
+      "prompt": "a futuristic city at night",
+      "width": 1024,
+      "height": 1024,
+      "steps": 25,
+      "seed": 42
+    },
+    "s3": {
+      "bucket_name": "my-images",
+      "endpoint_url": "https://s3.amazonaws.com"
+    },
+    "webhook": {
+      "url": "https://myapp.com/webhook",
+      "extra_params": {
+        "job_id": "abc123"
+      }
+    }
+  }
+}
+```
+
+## Cost Parameter
+
+All requests require a `cost` parameter for workload routing:
+
+```python
+await endpoint.request("/generate/sync", payload, cost=100)
+```
+
+The cost represents the computational workload and helps the autoscaler route requests to appropriate workers. The default cost is `100` for standard requests.
+
+## Error Responses
+
+Common error scenarios:
+
+```json
+{
+  "error": "Invalid workflow JSON",
+  "details": "Missing required field: workflow_json.3.inputs"
+}
+```
+
+```json
+{
+  "error": "Queue full",
+  "details": "Worker is busy. Please retry with another instance."
+}
+```
+
+The worker configuration (`worker.py:65-66`) rejects queued requests:
+- `allow_parallel_requests=false`: One generation at a time
+- `max_queue_time=0`: Reject immediately if busy

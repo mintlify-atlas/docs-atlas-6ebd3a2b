@@ -1,0 +1,513 @@
+---
+title: 'Monitoring & Observability'
+description: 'Log files, health checks, and system monitoring for PyWorker'
+---
+
+## Log Files
+
+PyWorker generates multiple log files across different lifecycle phases. Understanding each log's purpose is critical for effective monitoring and debugging.
+
+### Log File Locations
+
+| Log File | Location | Contents | Rotation |
+|----------|----------|----------|----------|
+| **debug.log** | `/workspace/debug.log` | Provisioning script output, startup logs | Append-only |
+| **pyworker.log** | `/workspace/pyworker.log` | PyWorker server runtime logs | Append-only |
+| **comfyui.log** | `/var/log/portal/comfyui.log` | ComfyUI execution logs, model loading | Optional |
+
+### debug.log
+
+**Purpose**: Captures provisioning script execution and server startup  
+**Written by**: `start_server.sh`, `default.sh`  
+**Key events**:
+
+```bash
+# Provisioning phase indicators
+[HH:MM:SS] Installing APT packages: aria2 rsync
+[HH:MM:SS] Downloading 4 file(s) with aria2c
+[HH:MM:SS] ✓ All models downloaded successfully
+[HH:MM:SS] ✓ All critical files verified
+
+# Startup phase indicators
+Waiting for provisioning marker: /workspace/.provisioning-complete
+Provisioning marker found
+launching PyWorker server
+```
+
+**Access**:
+```bash
+# Stream real-time logs
+tail -f /workspace/debug.log
+
+# Search for errors
+grep -i error /workspace/debug.log
+
+# Check provisioning completion
+grep "provisioning complete" /workspace/debug.log
+```
+
+<Warning>
+If `debug.log` contains `[ERROR] Provisioning Script failed`, the container will not start. Check for network issues, invalid HF_TOKEN, or disk space.
+</Warning>
+
+### pyworker.log
+
+**Purpose**: PyWorker application logs including request handling  
+**Written by**: PyWorker FastAPI server  
+**Key events**:
+
+```python
+# LoRA download events (worker.py:217)
+Downloading LoRA 'style_lora.safetensors' from 'Dylaaann/Lora'
+LoRA set ready (2): high_4step.safetensors, low_4step.safetensors
+
+# Request validation errors
+ValueError: Invalid LoRA filename 'malicious/../../etc/passwd'
+ValueError: lora_manifest signature mismatch
+ValueError: Workflow requested LoRAs not allowed by signed manifest
+
+# Benchmark results
+Pyworker heavy benchmark is disabled. Using lightweight bootstrap ping benchmark only.
+```
+
+**Access**:
+```bash
+# Monitor request processing
+tail -f /workspace/pyworker.log | grep -E "(LoRA|error|WARNING)"
+
+# Count LoRA downloads
+grep -c "Downloading LoRA" /workspace/pyworker.log
+
+# Check for validation errors
+grep "ValueError" /workspace/pyworker.log
+```
+
+### comfyui.log (MODEL_LOG_FILE)
+
+**Purpose**: ComfyUI engine execution logs  
+**Written by**: ComfyUI process  
+**Location**: Configurable via `MODEL_LOG_FILE` env var (default: `/var/log/portal/comfyui.log`)  
+**Key events**:
+
+```python
+# Model loading indicators (worker.py:48-56)
+# MODEL_LOAD_LOG_MSG = ["To see the GUI go to: "]
+To see the GUI go to: http://127.0.0.1:8188
+
+# Error indicators (worker.py:51-54)
+# MODEL_ERROR_LOG_MSGS = ["MetadataIncompleteBuffer", "[ERROR] Provisioning Script failed"]
+MetadataIncompleteBuffer: Corrupted model file
+[ERROR] Provisioning Script failed
+
+# Info indicators (worker.py:56)
+# MODEL_INFO_LOG_MSGS = ['"message":"Downloading']
+{"message":"Downloading checkpoint", "progress": 0.45}
+```
+
+**Log rotation** (optional):
+```bash
+# start_server.sh:141-150
+export ROTATE_MODEL_LOG=true
+# Rotates comfyui.log -> comfyui.log.old on startup
+```
+
+**Access**:
+```bash
+# Watch ComfyUI execution
+tail -f /var/log/portal/comfyui.log
+
+# Check for model loading completion
+grep "To see the GUI" /var/log/portal/comfyui.log
+
+# Find errors
+grep -E "(MetadataIncompleteBuffer|ERROR)" /var/log/portal/comfyui.log
+```
+
+<Note>
+ComfyUI logs are monitored by PyWorker's `LogActionConfig` to detect model loading, errors, and info events. These trigger internal state transitions.
+</Note>
+
+## Provisioning Markers
+
+Marker files signal provisioning status to PyWorker. These are critical for startup orchestration.
+
+### Marker Files
+
+| Marker File | Location | Meaning | Created By |
+|-------------|----------|---------|------------|
+| `.provisioning-complete` | `/workspace/` | Provisioning succeeded | `default.sh:123` |
+| `.provisioning-failed` | `/workspace/` | Provisioning failed | `default.sh:476` |
+
+### Provisioning Flow
+
+```bash
+# default.sh provisioning sequence
+function provisioning_start() {
+    rm -f "$PROVISIONING_DONE_MARKER" "$PROVISIONING_FAILED_MARKER"
+    
+    provisioning_get_apt_packages || return 1
+    provisioning_get_pip_packages || return 1
+    provisioning_get_nodes_parallel || return 1
+    provisioning_download_all_models_parallel || return 1
+    provisioning_verify || return 1
+    
+    touch "$PROVISIONING_DONE_MARKER"  # Success!
+}
+
+if ! provisioning_start; then
+    touch "$PROVISIONING_FAILED_MARKER"  # Failure!
+    exit 1
+fi
+```
+
+### Startup Wait Logic
+
+```bash
+# start_server.sh:28-68
+function wait_for_provisioning_completion() {
+    deadline=$(( $(date +%s) + PROVISIONING_WAIT_TIMEOUT_SECONDS ))
+    
+    while true; do
+        if [ -f "$PROVISIONING_DONE_MARKER" ]; then
+            return 0  # Success
+        fi
+        
+        if [ -f "$PROVISIONING_FAILED_MARKER" ]; then
+            report_error_and_exit "Provisioning failed before pyworker startup"
+        fi
+        
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            report_error_and_exit "Timed out waiting for provisioning marker"
+        fi
+        
+        sleep 5
+    done
+}
+```
+
+**Configuration**:
+```bash
+PROVISIONING_WAIT_TIMEOUT_SECONDS=2700  # 45 minutes
+PROVISIONING_WAIT_INTERVAL_SECONDS=5    # Poll every 5 seconds
+WAIT_FOR_PROVISIONING_MARKER=auto       # auto|true|false
+```
+
+<Warning>
+If `.provisioning-failed` exists, PyWorker will never start. Delete the marker and re-run provisioning script manually if recovery is possible.
+</Warning>
+
+## Health Check Endpoints
+
+PyWorker exposes multiple health check endpoints for different purposes.
+
+### /readyz (Readiness Check)
+
+**Route**: Configurable via `PYWORKER_READY_ROUTE` (default: `/readyz`)  
+**Purpose**: Verify container is ready to accept requests  
+**Handler**: `readyz_remote()` (worker.py:479-501)  
+
+**Health checks performed**:
+
+```python
+async def readyz_remote(**params):
+    # 1. Check provisioning completed successfully
+    if PROVISIONING_FAILED_MARKER.exists():
+        raise RuntimeError(f"Provisioning failed: {PROVISIONING_FAILED_MARKER}")
+    
+    if not PROVISIONING_DONE_MARKER.exists():
+        raise RuntimeError(f"Provisioning not complete: {PROVISIONING_DONE_MARKER}")
+    
+    # 2. Verify ComfyUI health endpoint
+    health_url = f"{MODEL_HEALTHCHECK_BASE_URL}{MODEL_HEALTHCHECK_ENDPOINT}"
+    async with aiohttp.ClientSession(timeout=10) as session:
+        async with session.get(health_url) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Model healthcheck failed status={response.status}"
+                )
+    
+    # 3. Return success
+    return {
+        "ok": True,
+        "healthcheck_url": health_url,
+        "model_server_base_url": MODEL_SERVER_BASE_URL
+    }
+```
+
+**Response**:
+```json
+{
+  "ok": true,
+  "healthcheck_url": "http://127.0.0.1:18288/health",
+  "model_server_base_url": "http://127.0.0.1:18288",
+  "params": {}
+}
+```
+
+**Usage**:
+```bash
+# Check container readiness
+curl https://worker-instance.vast.ai/readyz
+
+# Kubernetes-style readiness probe
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 3000
+  initialDelaySeconds: 60
+  periodSeconds: 10
+```
+
+### /health (ComfyUI Health)
+
+**Route**: Configurable via `PYWORKER_MODEL_HEALTHCHECK_ENDPOINT` (default: `/health`)  
+**Purpose**: Verify ComfyUI API wrapper is responsive  
+**Handler**: ComfyUI API wrapper (not PyWorker)  
+
+**Configuration**:
+```bash
+PYWORKER_HEALTHCHECK_BASE_URL=http://127.0.0.1:18288
+PYWORKER_MODEL_HEALTHCHECK_ENDPOINT=/health
+```
+
+**Direct check**:
+```bash
+# Inside container
+curl http://127.0.0.1:18288/health
+```
+
+### /benchmark/ping (Bootstrap Benchmark)
+
+**Route**: `/benchmark/ping`  
+**Purpose**: Lightweight startup benchmark to satisfy PyWorker initialization  
+**Handler**: `bootstrap_ping_remote()` (worker.py:475-476)  
+**Enabled**: When `PYWORKER_ENABLE_BOOTSTRAP_BENCHMARK=true` (default)  
+
+```python
+# worker.py:470-476
+async def bootstrap_ping_remote(**params):
+    return {"ok": True, "params": params}
+
+def bootstrap_ping_generator() -> dict[str, Any]:
+    return {"ping": True, "ts": time.time()}
+```
+
+**Configuration**:
+```python
+# worker.py:504-519
+benchmark_config=BenchmarkConfig(
+    generator=bootstrap_ping_generator,
+    runs=1,
+    concurrency=1,
+    do_warmup=False
+)
+```
+
+<Info>
+The bootstrap benchmark is intentionally lightweight (just a ping) because heavy benchmarks would require downloading large models during startup.
+</Info>
+
+## Monitoring Strategies
+
+### Real-Time Monitoring
+
+**Monitor provisioning progress**:
+```bash
+# SSH into Vast.ai container
+tail -f /workspace/debug.log | grep -E "(\[.*\]|✓|ERROR)"
+```
+
+**Monitor request processing**:
+```bash
+# Watch PyWorker logs
+tail -f /workspace/pyworker.log
+
+# Watch ComfyUI execution
+tail -f /var/log/portal/comfyui.log
+```
+
+**Monitor LoRA downloads**:
+```bash
+# Track downloads in real-time
+grep "Downloading LoRA" /workspace/pyworker.log | tail -f
+
+# Count unique LoRAs downloaded
+grep "LoRA set ready" /workspace/pyworker.log | wc -l
+```
+
+### Health Check Monitoring
+
+**Continuous health polling**:
+```bash
+#!/bin/bash
+while true; do
+    if curl -sf https://worker.vast.ai/readyz > /dev/null; then
+        echo "$(date): HEALTHY"
+    else
+        echo "$(date): UNHEALTHY"
+    fi
+    sleep 30
+done
+```
+
+**External monitoring integration**:
+```python
+import requests
+import time
+
+def check_worker_health(worker_url):
+    try:
+        response = requests.get(f"{worker_url}/readyz", timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("ok") == True
+    except requests.RequestException:
+        return False
+    return False
+
+# Use with monitoring services (Datadog, Prometheus, etc.)
+while True:
+    healthy = check_worker_health("https://worker.vast.ai")
+    # Send metric to monitoring service
+    time.sleep(60)
+```
+
+### Error Rate Monitoring
+
+**Track validation errors**:
+```bash
+# Count manifest signature failures
+grep -c "lora_manifest signature" /workspace/pyworker.log
+
+# Count invalid LoRA filenames
+grep -c "Invalid LoRA filename" /workspace/pyworker.log
+
+# Count provisioning failures
+ls -l /workspace/.provisioning-failed 2>/dev/null && echo "FAILED" || echo "OK"
+```
+
+### Performance Metrics
+
+**Workload estimation analysis**:
+```python
+# Extract workload estimates from logs
+import re
+import json
+
+# Parse pyworker.log for workload calculations
+with open('/workspace/pyworker.log') as f:
+    for line in f:
+        if 'workload' in line.lower():
+            # Extract and analyze workload patterns
+            print(line)
+```
+
+**LoRA download performance**:
+```bash
+# Measure download times from debug.log
+grep -E "(Downloading.*safetensors|Download.*complete)" /var/log/portal/comfyui.log
+```
+
+## Log Aggregation
+
+For production deployments, aggregate logs to centralized storage:
+
+### Option 1: Fluentd/Fluent Bit
+
+```yaml
+# fluent-bit.conf
+[INPUT]
+    Name tail
+    Path /workspace/*.log,/var/log/portal/*.log
+    Tag pyworker.*
+
+[OUTPUT]
+    Name elasticsearch
+    Match *
+    Host elasticsearch-service
+    Port 9200
+```
+
+### Option 2: Vector
+
+```toml
+# vector.toml
+[sources.pyworker_logs]
+type = "file"
+includes = ["/workspace/*.log", "/var/log/portal/*.log"]
+
+[sinks.loki]
+type = "loki"
+inputs = ["pyworker_logs"]
+endpoint = "http://loki:3100"
+```
+
+### Option 3: CloudWatch Logs Agent
+
+```json
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/workspace/debug.log",
+            "log_group_name": "/pyworker/provisioning"
+          },
+          {
+            "file_path": "/workspace/pyworker.log",
+            "log_group_name": "/pyworker/runtime"
+          },
+          {
+            "file_path": "/var/log/portal/comfyui.log",
+            "log_group_name": "/pyworker/comfyui"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+## Alerting Rules
+
+Recommended alerts for production monitoring:
+
+### Critical Alerts
+
+1. **Provisioning Failure**
+   - Trigger: `.provisioning-failed` marker exists
+   - Action: Page on-call engineer, auto-terminate container
+
+2. **Health Check Failure**
+   - Trigger: `/readyz` returns non-200 for >2 minutes
+   - Action: Remove from load balancer, investigate
+
+3. **Manifest Signature Failures**
+   - Trigger: >10 signature mismatches in 5 minutes
+   - Action: Alert security team, possible attack
+
+### Warning Alerts
+
+1. **LoRA Download Failures**
+   - Trigger: `HF_TOKEN is required to download LoRAs` error
+   - Action: Verify HuggingFace token validity
+
+2. **Slow Provisioning**
+   - Trigger: Provisioning >20 minutes without completion
+   - Action: Check network bandwidth, HuggingFace availability
+
+3. **High Error Rate**
+   - Trigger: >5% of requests failing validation
+   - Action: Review client request patterns
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/operations/architecture">
+    System architecture and request flow
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Common issues and debugging procedures
+  </Card>
+</CardGroup>

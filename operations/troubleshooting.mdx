@@ -1,0 +1,751 @@
+---
+title: 'Troubleshooting Guide'
+description: 'Common issues, error messages, and debugging procedures for PyWorker'
+---
+
+## Quick Diagnostics
+
+Start troubleshooting with these quick checks:
+
+<Steps>
+  <Step title="Check provisioning status">
+    ```bash
+    ls -la /workspace/.provisioning-*
+    # Should show: .provisioning-complete
+    # Should NOT show: .provisioning-failed
+    ```
+  </Step>
+  
+  <Step title="Verify health endpoint">
+    ```bash
+    curl https://your-worker.vast.ai/readyz
+    # Expected: {"ok": true, ...}
+    ```
+  </Step>
+  
+  <Step title="Check logs for errors">
+    ```bash
+    grep -i error /workspace/debug.log
+    grep -i error /workspace/pyworker.log
+    grep -E "(ERROR|MetadataIncompleteBuffer)" /var/log/portal/comfyui.log
+    ```
+  </Step>
+</Steps>
+
+## Provisioning Failures
+
+Provisioning issues prevent PyWorker from starting. These occur during the initial container setup phase.
+
+### Issue: Provisioning Failed Marker Exists
+
+**Symptoms**:
+- `/workspace/.provisioning-failed` file exists
+- PyWorker refuses to start
+- `/readyz` returns error: `"Provisioning failed"`
+
+**Error message** (start_server.sh:58):
+```bash
+ERROR: Provisioning failed before pyworker startup
+```
+
+**Diagnosis**:
+```bash
+# Check provisioning logs
+cat /workspace/debug.log | grep -A 10 "\[ERROR\]"
+
+# Common error patterns:
+grep -E "(aria2c exited|Failed to install|Missing:)" /workspace/debug.log
+```
+
+**Common causes**:
+
+1. **Invalid HuggingFace token** (start_server.sh:122)
+   ```
+   ERROR: HF_TOKEN must be set when BACKEND is set!
+   ```
+   
+   **Solution**:
+   ```bash
+   # Verify token validity
+   curl -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/api/whoami-v2
+   # Should return 200 with user info
+   
+   # Update token in Vast.ai template environment variables
+   ```
+
+2. **Model download failures** (default.sh:369-372)
+   ```
+   [ERROR] aria2c exited with code 1 — some downloads may have failed
+   ```
+   
+   **Solution**:
+   ```bash
+   # Check network connectivity
+   curl -I https://huggingface.co
+   
+   # Retry failed downloads manually
+   aria2c -x 16 -s 16 \
+     --header="Authorization: Bearer $HF_TOKEN" \
+     https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+   ```
+
+3. **Insufficient disk space**
+   ```
+   [ERROR] aria2c: No space left on device
+   ```
+   
+   **Solution**:
+   ```bash
+   # Check available space (need ~50GB free)
+   df -h /workspace
+   
+   # Increase disk allocation in Vast.ai template
+   # Recommended: 100GB minimum
+   ```
+
+4. **Critical files missing** (default.sh:377-419)
+   ```
+   [ERROR] Missing: /workspace/ComfyUI/models/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+   [ERROR] Verification failed — some files are missing
+   ```
+   
+   **Solution**:
+   ```bash
+   # Identify missing files
+   grep "Missing:" /workspace/debug.log
+   
+   # Download missing files manually
+   export HF_HUB_ENABLE_HF_TRANSFER=1
+   pip install huggingface_hub[hf_transfer]
+   
+   python3 << EOF
+   from huggingface_hub import hf_hub_download
+   hf_hub_download(
+       repo_id="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+       filename="split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+       local_dir="/workspace/ComfyUI/models",
+       token="$HF_TOKEN"
+   )
+   EOF
+   ```
+
+**Recovery steps**:
+```bash
+# 1. Remove failure marker
+rm /workspace/.provisioning-failed
+
+# 2. Re-run provisioning script
+bash /workspace/default.sh
+
+# 3. Verify completion
+ls -la /workspace/.provisioning-complete
+
+# 4. Restart PyWorker
+bash /workspace/start_server.sh
+```
+
+<Warning>
+Do NOT delete `.provisioning-failed` without addressing the root cause. PyWorker will fail again on the same issue.
+</Warning>
+
+### Issue: Provisioning Timeout
+
+**Symptoms**:
+- Container starts but never becomes ready
+- `/readyz` returns: `"Provisioning not complete"`
+- Timeout after 45 minutes (2700 seconds)
+
+**Error message** (start_server.sh:63):
+```bash
+ERROR: Timed out waiting for provisioning marker: /workspace/.provisioning-complete
+```
+
+**Diagnosis**:
+```bash
+# Check provisioning progress
+tail -f /workspace/debug.log
+
+# Look for stalled downloads
+ps aux | grep aria2c
+ps aux | grep git
+```
+
+**Common causes**:
+
+1. **Slow network connection**
+   - Vast.ai instance has limited bandwidth
+   - HuggingFace CDN throttling
+   
+   **Solution**:
+   ```bash
+   # Increase timeout (start_server.sh:13)
+   export PROVISIONING_WAIT_TIMEOUT_SECONDS=5400  # 90 minutes
+   
+   # Or choose faster Vast.ai datacenter location
+   ```
+
+2. **Git clone hanging**
+   - Custom node repository unavailable
+   - GitHub rate limiting
+   
+   **Solution**:
+   ```bash
+   # Check which clone is stuck
+   ps aux | grep "git clone"
+   
+   # Kill stuck process and retry
+   pkill -f "git clone"
+   
+   # Clone manually
+   cd /workspace/ComfyUI/custom_nodes
+   git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+   ```
+
+### Issue: Custom Node Installation Failures
+
+**Symptoms**:
+- Provisioning completes but ComfyUI fails to start
+- Missing custom nodes in ComfyUI
+
+**Error message** (default.sh:239-243):
+```bash
+[WARN] Some requirements for ComfyUI-WanVideoWrapper failed (non-fatal)
+[WARN] install.py for ComfyUI-Frame-Interpolation had issues (non-fatal)
+```
+
+**Diagnosis**:
+```bash
+# Check custom node directories
+ls -la /workspace/ComfyUI/custom_nodes/
+
+# Verify critical nodes
+for node in ComfyUI-WanVideoWrapper ComfyUI-VideoHelperSuite ComfyUI-Frame-Interpolation; do
+    [ -d "/workspace/ComfyUI/custom_nodes/$node" ] && echo "✓ $node" || echo "✗ $node MISSING"
+done
+```
+
+**Solution**:
+```bash
+# Reinstall missing node
+cd /workspace/ComfyUI/custom_nodes
+git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+cd ComfyUI-WanVideoWrapper
+pip install -r requirements.txt
+python install.py
+```
+
+## Runtime Failures
+
+Issues occurring after successful provisioning during request processing.
+
+### Issue: Health Check Failures
+
+**Symptoms**:
+- `/readyz` returns 500 error
+- Readiness probe failing
+
+**Error message** (worker.py:481-483):
+```python
+RuntimeError: Provisioning failed: /workspace/.provisioning-failed
+RuntimeError: Provisioning not complete: /workspace/.provisioning-complete
+```
+
+**Diagnosis**:
+```bash
+# Test health check directly
+curl -v https://worker.vast.ai/readyz
+
+# Check ComfyUI health
+curl http://127.0.0.1:18288/health
+```
+
+**Solutions**:
+
+1. **ComfyUI not responding** (worker.py:491-494)
+   ```python
+   RuntimeError: Model healthcheck failed status=503 url=http://127.0.0.1:18288/health
+   ```
+   
+   **Fix**:
+   ```bash
+   # Check if ComfyUI is running
+   ps aux | grep comfyui
+   
+   # Check ComfyUI logs
+   tail -f /var/log/portal/comfyui.log
+   
+   # Restart ComfyUI API wrapper
+   # (restart mechanism depends on your deployment)
+   ```
+
+2. **Provisioning markers corrupted**
+   ```bash
+   # Verify marker files
+   ls -la /workspace/.provisioning-complete
+   
+   # Recreate if needed
+   touch /workspace/.provisioning-complete
+   rm -f /workspace/.provisioning-failed
+   ```
+
+### Issue: LoRA Download Failures
+
+**Symptoms**:
+- Request fails with LoRA-related error
+- LoRA download hangs
+
+**Error message** (worker.py:215):
+```python
+RuntimeError: HF_TOKEN is required to download LoRAs.
+```
+
+**Diagnosis**:
+```bash
+# Check HF_TOKEN configuration
+echo $HF_TOKEN
+
+# Test HuggingFace authentication
+curl -H "Authorization: Bearer $HF_TOKEN" \
+     https://huggingface.co/api/whoami-v2
+
+# Check LoRA directory permissions
+ls -la /workspace/ComfyUI/models/loras/
+```
+
+**Solutions**:
+
+1. **Missing HF_TOKEN**
+   ```bash
+   # Set token in environment
+   export HF_TOKEN="hf_your_token_here"
+   
+   # Or configure in Vast.ai template
+   ```
+
+2. **LoRA file corruption** (worker.py:236)
+   ```python
+   RuntimeError: LoRA download finished but file is missing: /workspace/ComfyUI/models/loras/style.safetensors
+   ```
+   
+   **Fix**:
+   ```bash
+   # Remove corrupted file
+   rm /workspace/ComfyUI/models/loras/style.safetensors
+   rm /workspace/ComfyUI/models/loras/style.safetensors.lock
+   
+   # Retry download (will happen automatically on next request)
+   ```
+
+3. **File locking deadlock**
+   ```bash
+   # Check for stale lock files
+   find /workspace/ComfyUI/models/loras -name "*.lock" -mmin +60
+   
+   # Remove stale locks (>60 minutes old)
+   find /workspace/ComfyUI/models/loras -name "*.lock" -mmin +60 -delete
+   ```
+
+### Issue: Manifest Validation Failures
+
+**Symptoms**:
+- Requests rejected with signature errors
+- Unauthorized LoRA access
+
+**Error messages**:
+
+```python
+# worker.py:272-273
+ValueError: Signed lora_manifest is required but missing.
+
+# worker.py:183
+ValueError: lora_manifest signature expired.
+
+# worker.py:198
+ValueError: lora_manifest signature mismatch.
+
+# worker.py:171-173
+ValueError: lora_manifest.endpoint mismatch. expected='direct-instance' got='other-endpoint'
+
+# worker.py:284-287
+ValueError: Workflow requested LoRAs not allowed by signed manifest: unauthorized_lora.safetensors
+```
+
+**Diagnosis**:
+```bash
+# Check manifest secret configuration
+echo $PYWORKER_MANIFEST_SECRET
+echo $PYWORKER_REQUIRE_MANIFEST
+echo $PYWORKER_MANIFEST_ENDPOINT
+
+# Verify secret matches between client and worker
+# (both must use same HMAC secret)
+```
+
+**Solutions**:
+
+1. **Signature mismatch** (worker.py:198)
+   - Client and worker have different `PYWORKER_MANIFEST_SECRET`
+   - Payload modified in transit
+   
+   **Fix**:
+   ```bash
+   # Verify secret matches on both sides
+   # Client code:
+   const signature = crypto
+     .createHmac('sha256', MANIFEST_SECRET)
+     .update(JSON.stringify(payload))
+     .digest('hex');
+   
+   # Worker expects same secret in PYWORKER_MANIFEST_SECRET
+   ```
+
+2. **Expired manifest** (worker.py:183)
+   - Timestamp older than 15 minutes (default)
+   
+   **Fix**:
+   ```bash
+   # Increase expiry time (worker.py:79)
+   export PYWORKER_MANIFEST_MAX_AGE_SECONDS=1800  # 30 minutes
+   
+   # Or ensure client generates fresh timestamps:
+   # issuedAt: Date.now()  // Must be current time
+   ```
+
+3. **Endpoint mismatch** (worker.py:171-173)
+   ```bash
+   # Ensure manifest endpoint matches worker configuration
+   export PYWORKER_MANIFEST_ENDPOINT=direct-instance
+   
+   # Client must set same endpoint in manifest:
+   # { endpoint: "direct-instance", ... }
+   ```
+
+4. **Unauthorized LoRAs** (worker.py:284-287)
+   - Workflow requests LoRAs not in signed manifest
+   
+   **Fix**:
+   ```javascript
+   // Client: Include all LoRAs in manifest
+   const manifest = {
+     requiredLoras: [
+       "style_lora.safetensors",
+       "high_4step.safetensors",
+       "low_4step.safetensors"
+     ],
+     // ... other fields
+   };
+   ```
+
+<Warning>
+NEVER disable manifest validation in production. If you must debug, temporarily set `PYWORKER_REQUIRE_MANIFEST=false`, but re-enable after testing.
+</Warning>
+
+### Issue: Invalid LoRA Filenames
+
+**Symptoms**:
+- Request rejected with validation error
+
+**Error message** (worker.py:116):
+```python
+ValueError: Invalid LoRA filename '../../../etc/passwd'.
+ValueError: Invalid LoRA filename 'malicious/lora.safetensors'.
+```
+
+**Diagnosis**:
+PyWorker validates LoRA filenames to prevent path traversal attacks:
+
+```python
+# worker.py:106-118
+def sanitize_lora_name(value: str) -> str | None:
+    normalized = value.split("/")[-1].split("\\")[-1]
+    if not re.fullmatch(r"[^/\\]+\.safetensors", normalized):
+        raise ValueError(f"Invalid LoRA filename '{value}'.")
+```
+
+**Solution**:
+```javascript
+// Client: Only send base filename
+const loraName = "style_lora.safetensors";  // ✓ Valid
+// NOT: "/path/to/style_lora.safetensors"  // ✗ Invalid
+// NOT: "../style_lora.safetensors"        // ✗ Invalid
+```
+
+### Issue: Request Queue Rejection
+
+**Symptoms**:
+- Requests fail when worker is busy
+- "Queue full" or "Worker busy" errors
+
+**Cause**:
+PyWorker enforces `MAX_QUEUE_TIME=0.0` to reject concurrent requests (worker.py:66):
+
+```python
+# Enforce 1 worker = 1 generation
+MAX_QUEUE_TIME = 0.0  # Reject immediately if busy
+```
+
+**Solution**:
+This is intentional behavior. Implement client-side retry logic:
+
+```javascript
+async function generateWithRetry(payload, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fetch('/generate/sync', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      if (error.message.includes('queue') && i < maxRetries - 1) {
+        // Wait and retry with exponential backoff
+        await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+```
+
+Or route to different worker:
+```javascript
+const workers = [
+  'https://worker1.vast.ai',
+  'https://worker2.vast.ai',
+  'https://worker3.vast.ai'
+];
+
+for (const workerUrl of workers) {
+  try {
+    return await fetch(`${workerUrl}/generate/sync`, {...});
+  } catch (error) {
+    // Try next worker
+    continue;
+  }
+}
+```
+
+## Model Loading Issues
+
+### Issue: Corrupted Model Files
+
+**Symptoms**:
+- ComfyUI fails to load models
+- Generation requests hang
+
+**Error message** (worker.py:52):
+```
+MetadataIncompleteBuffer: Corrupted model file
+```
+
+**Diagnosis**:
+```bash
+# Check model file sizes
+cd /workspace/ComfyUI/models/diffusion_models
+ls -lh
+
+# Expected sizes (approximate):
+# wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors: ~14GB
+# wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors: ~14GB
+
+# Verify checksums (if available)
+md5sum wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+```
+
+**Solution**:
+```bash
+# Remove corrupted file
+rm /workspace/ComfyUI/models/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+
+# Re-download
+export HF_HUB_ENABLE_HF_TRANSFER=1
+python3 << EOF
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id="Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    filename="split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+    local_dir="/workspace/ComfyUI/models",
+    token="$HF_TOKEN",
+    resume_download=True
+)
+EOF
+
+# Restart ComfyUI
+```
+
+## Configuration Issues
+
+### Issue: Missing Required Environment Variables
+
+**Error messages** (start_server.sh:122-124):
+```bash
+ERROR: HF_TOKEN must be set when BACKEND is set!
+ERROR: CONTAINER_ID must be set!
+ERROR: For comfyui backends, COMFY_MODEL must be set!
+```
+
+**Solution**:
+```bash
+# Verify all required variables in Vast.ai template
+export BACKEND=comfyui-json
+export CONTAINER_ID=<vast_container_id>
+export HF_TOKEN=<hf_token>
+export PYWORKER_MANIFEST_SECRET=<hmac_secret>
+```
+
+### Issue: SSL Certificate Failures
+
+**Symptoms**:
+- HTTPS requests fail
+- Certificate validation errors
+
+**Error message** (start_server.sh:259-260):
+```bash
+ERROR: Failed to sign SSL certificate
+```
+
+**Diagnosis**:
+```bash
+# Check SSL configuration
+echo $USE_SSL  # Should be "true"
+echo $CONTAINER_ID  # Must be valid Vast.ai ID
+
+# Verify certificate files
+ls -la /etc/instance.{key,csr,crt}
+```
+
+**Solution**:
+```bash
+# Regenerate SSL certificate
+rm -f /etc/instance.{key,csr,crt}
+
+# Re-run certificate generation (from start_server.sh:246-260)
+openssl req -newkey rsa:2048 -subj "/C=US/ST=CA/CN=pyworker.vast.ai/" \
+    -nodes -sha256 -keyout /etc/instance.key -out /etc/instance.csr \
+    -config /etc/openssl-san.cnf
+
+curl --header 'Content-Type: application/octet-stream' \
+     --data-binary @/etc/instance.csr \
+     -X POST "https://console.vast.ai/api/v0/sign_cert/?instance_id=$CONTAINER_ID" \
+     > /etc/instance.crt
+```
+
+## Performance Issues
+
+### Issue: Slow Generation Times
+
+**Diagnosis**:
+```bash
+# Check GPU utilization
+nvidia-smi
+
+# Monitor GPU during generation
+watch -n 1 nvidia-smi
+
+# Check workload estimation
+grep "workload" /workspace/pyworker.log
+```
+
+**Solutions**:
+
+1. **GPU memory exhausted**
+   ```bash
+   # Check VRAM usage
+   nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+   
+   # Reduce batch size or resolution in workflow
+   ```
+
+2. **VRAM fragmentation**
+   ```bash
+   # Restart ComfyUI to clear VRAM
+   # (restart mechanism depends on deployment)
+   ```
+
+3. **Slow disk I/O**
+   ```bash
+   # Check I/O wait
+   iostat -x 1
+   
+   # Use faster storage in Vast.ai template
+   ```
+
+## Debugging Workflows
+
+### Enable Detailed Logging
+
+```bash
+# Increase PyWorker log verbosity
+export PYWORKER_LOG_LEVEL=DEBUG
+
+# Enable ComfyUI debug mode
+export COMFYUI_DEBUG=1
+
+# Restart services
+```
+
+### Interactive Debugging
+
+```python
+# Add to worker.py for debugging
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Log request payloads
+log.debug(f"Request payload: {json.dumps(payload, indent=2)}")
+
+# Log LoRA resolution
+log.debug(f"Resolved LoRAs: {required_loras}")
+```
+
+### Test Individual Components
+
+```bash
+# Test ComfyUI directly
+curl -X POST http://127.0.0.1:18288/generate/sync \
+  -H "Content-Type: application/json" \
+  -d @test_workflow.json
+
+# Test LoRA download
+python3 << EOF
+from workers.comfyui_json.worker import ensure_lora_downloaded
+result = ensure_lora_downloaded("test_lora.safetensors")
+print(f"Downloaded to: {result}")
+EOF
+
+# Test manifest validation
+python3 << EOF
+from workers.comfyui_json.worker import parse_and_verify_manifest
+manifest = {...}  # Your test manifest
+result = parse_and_verify_manifest(manifest)
+print(f"Validated LoRAs: {result}")
+EOF
+```
+
+## Getting Help
+
+<CardGroup cols={2}>
+  <Card title="Architecture Docs" icon="sitemap" href="/operations/architecture">
+    Understand system components and request flow
+  </Card>
+  <Card title="Monitoring Guide" icon="chart-line" href="/operations/monitoring">
+    Learn about logs, health checks, and metrics
+  </Card>
+</CardGroup>
+
+### Support Channels
+
+- **GitHub Issues**: [vast-ai/pyworker](https://github.com/vast-ai/pyworker/issues)
+- **Vast.ai Support**: [vast.ai/support](https://vast.ai/support)
+- **Community Discord**: Check Vast.ai documentation for invite link
+
+### Report a Bug
+
+When reporting issues, include:
+
+1. Full error message and stack trace
+2. Relevant log excerpts from `/workspace/debug.log` and `/workspace/pyworker.log`
+3. Environment variables (redact secrets)
+4. Steps to reproduce
+5. PyWorker version (`git rev-parse HEAD` in `/workspace/vast-pyworker`)
+6. Vast.ai instance details (GPU model, disk size, network speed)
